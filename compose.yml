@@ -14,6 +14,14 @@ services:
       interval: 2s
       timeout: 2s
       retries: 20
+    networks:
+      - default
 
 volumes:
   pgdata:
+
+networks:
+  default:
+    ipam:
+      config:
+        - subnet: 172.32.0.0/16
