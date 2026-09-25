@@ -3,7 +3,11 @@ from app.ledger.models import Asset, RawTransfer
 
 def test_asset_erc20_has_no_position_id():
     asset = Asset(
-        kind="erc20", contract_address="0xusdc", position_id=None, symbol="USDC", decimals=6
+        kind="erc20",
+        contract_address="0xusdc",
+        position_id=None,
+        symbol="USDC",
+        decimals=6,
     )
     assert asset.position_id is None
 
