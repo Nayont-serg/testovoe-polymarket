@@ -82,3 +82,52 @@ async def test_batch_call_returns_results_in_request_order():
     )
     assert results == ["0x1", "0x2"]
     await client.aclose()
+
+
+@respx.mock
+async def test_batch_call_falls_back_to_next_url_when_item_has_error():
+    respx.post("https://a.example").mock(
+        return_value=httpx.Response(
+            200,
+            json=[
+                {"jsonrpc": "2.0", "id": 0, "result": "0x1"},
+                {
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "error": {"code": -32000, "message": "boom"},
+                },
+            ],
+        )
+    )
+    respx.post("https://b.example").mock(
+        return_value=httpx.Response(
+            200,
+            json=[
+                {"jsonrpc": "2.0", "id": 0, "result": "0x1"},
+                {"jsonrpc": "2.0", "id": 1, "result": "0x2"},
+            ],
+        )
+    )
+    client = make_client(["https://a.example", "https://b.example"])
+    results = await client.batch_call(
+        "call", [("eth_getBlockByNumber", ["0x1"]), ("eth_getBlockByNumber", ["0x2"])]
+    )
+    assert results == ["0x1", "0x2"]
+    await client.aclose()
+
+
+@respx.mock
+async def test_batch_call_raises_when_response_missing_requested_id():
+    respx.post("https://a.example").mock(
+        return_value=httpx.Response(
+            200,
+            json=[{"jsonrpc": "2.0", "id": 0, "result": "0x1"}],
+        )
+    )
+    client = make_client(["https://a.example"])
+    with pytest.raises(RpcAllEndpointsExhaustedError):
+        await client.batch_call(
+            "call",
+            [("eth_getBlockByNumber", ["0x1"]), ("eth_getBlockByNumber", ["0x2"])],
+        )
+    await client.aclose()

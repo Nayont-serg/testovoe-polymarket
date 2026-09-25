@@ -55,7 +55,7 @@ class JsonRpcClient:
         for url in self._available_urls(kind):
             try:
                 body = await self._post(url, payload)
-            except (httpx.HTTPError, httpx.HTTPStatusError) as exc:
+            except httpx.HTTPError as exc:
                 last_error = exc
                 continue
             if "error" in body:
@@ -75,10 +75,27 @@ class JsonRpcClient:
         for url in self._available_urls(kind):
             try:
                 body = await self._post(url, payload)
-            except (httpx.HTTPError, httpx.HTTPStatusError) as exc:
+            except httpx.HTTPError as exc:
                 last_error = exc
                 continue
-            by_id = {item["id"]: item.get("result") for item in body}
+            errors = [
+                response_item["error"]
+                for response_item in body
+                if "error" in response_item
+            ]
+            if errors:
+                last_error = RuntimeError(errors[0])
+                continue
+            by_id = {
+                response_item["id"]: response_item.get("result")
+                for response_item in body
+            }
+            missing_ids = [
+                index for index in range(len(requests)) if index not in by_id
+            ]
+            if missing_ids:
+                last_error = RuntimeError(f"batch response missing ids {missing_ids}")
+                continue
             return [by_id[index] for index in range(len(requests))]
         raise RpcAllEndpointsExhaustedError(kind, requests[0][0]) from last_error
 
