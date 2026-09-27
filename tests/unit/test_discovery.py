@@ -138,9 +138,17 @@ def _encode_transfer_batch_data(position_ids: list[int], amounts: list[int]) -> 
 
 
 class FakeCtfClient:
-    def __init__(self, single_in_log: dict[str, Any], batch_out_log: dict[str, Any]) -> None:
+    def __init__(
+        self,
+        single_out_log: dict[str, Any],
+        single_in_log: dict[str, Any],
+        batch_out_log: dict[str, Any],
+        batch_in_log: dict[str, Any],
+    ) -> None:
+        self._single_out_log = single_out_log
         self._single_in_log = single_in_log
         self._batch_out_log = batch_out_log
+        self._batch_in_log = batch_in_log
 
     async def call(
         self, _kind: str, _method: str, params: list[dict[str, Any]]
@@ -148,16 +156,28 @@ class FakeCtfClient:
         topics = params[0]["topics"]
         is_out_query = topics[2] is not None
         if topics[0] == TRANSFER_SINGLE_TOPIC:
-            return [] if is_out_query else [self._single_in_log]
+            return [self._single_out_log] if is_out_query else [self._single_in_log]
         if topics[0] == TRANSFER_BATCH_TOPIC:
-            return [self._batch_out_log] if is_out_query else []
+            return [self._batch_out_log] if is_out_query else [self._batch_in_log]
         raise AssertionError(f"unexpected topic0 {topics[0]}")
 
 
-async def test_discover_ctf_transfers_merges_single_and_batch_and_explodes_pairs() -> None:
+async def test_discover_ctf_transfers_merges_out_and_in_and_explodes_pairs() -> None:
     wallet = "0x46b353667fd7d846af3bbeda6584b0e5b883d3de"
     counterparty = "0x9999999999999999999999999999999999999999"
     operator = "0x8888888888888888888888888888888888888888"
+    single_out_log = {
+        "topics": [
+            TRANSFER_SINGLE_TOPIC,
+            address_topic(operator),
+            address_topic(wallet),
+            address_topic(counterparty),
+        ],
+        "data": "0x" + format(9, "064x") + format(15, "064x"),
+        "blockNumber": hex(9),
+        "transactionHash": "0xsingle-out",
+        "logIndex": "0x0",
+    }
     single_in_log = {
         "topics": [
             TRANSFER_SINGLE_TOPIC,
@@ -167,7 +187,7 @@ async def test_discover_ctf_transfers_merges_single_and_batch_and_explodes_pairs
         ],
         "data": "0x" + format(42, "064x") + format(7, "064x"),
         "blockNumber": hex(11),
-        "transactionHash": "0xsingle",
+        "transactionHash": "0xsingle-in",
         "logIndex": "0x0",
     }
     batch_out_log = {
@@ -179,32 +199,55 @@ async def test_discover_ctf_transfers_merges_single_and_batch_and_explodes_pairs
         ],
         "data": _encode_transfer_batch_data([1, 2], [100, 200]),
         "blockNumber": hex(22),
-        "transactionHash": "0xbatch",
+        "transactionHash": "0xbatch-out",
         "logIndex": "0x1",
     }
-    client = FakeCtfClient(single_in_log, batch_out_log)
+    batch_in_log = {
+        "topics": [
+            TRANSFER_BATCH_TOPIC,
+            address_topic(operator),
+            address_topic(counterparty),
+            address_topic(wallet),
+        ],
+        "data": _encode_transfer_batch_data([3], [300]),
+        "blockNumber": hex(33),
+        "transactionHash": "0xbatch-in",
+        "logIndex": "0x2",
+    }
+    client = FakeCtfClient(single_out_log, single_in_log, batch_out_log, batch_in_log)
     limiter = AdaptiveConcurrencyLimiter(2, 60, 100, 180)
     transfers = await discover_ctf_transfers(
         client, limiter, "0xctf", wallet, start_block=0, end_block=100, window=1000
     )
 
-    single_transfers = [t for t in transfers if t.source_event == "TransferSingle"]
-    assert len(single_transfers) == 1
-    single_transfer = single_transfers[0]
-    assert single_transfer.position_id == 42
-    assert single_transfer.amount == 7
-    assert single_transfer.from_address == counterparty.lower()
-    assert single_transfer.to_address == wallet.lower()
-    assert single_transfer.tx_hash == "0xsingle"
+    single_transfers = sorted(
+        (t for t in transfers if t.source_event == "TransferSingle"),
+        key=lambda t: t.tx_hash,
+    )
+    assert [t.tx_hash for t in single_transfers] == ["0xsingle-in", "0xsingle-out"]
+    single_in = next(t for t in single_transfers if t.tx_hash == "0xsingle-in")
+    assert (single_in.position_id, single_in.amount) == (42, 7)
+    assert single_in.from_address == counterparty.lower()
+    assert single_in.to_address == wallet.lower()
+    single_out = next(t for t in single_transfers if t.tx_hash == "0xsingle-out")
+    assert (single_out.position_id, single_out.amount) == (9, 15)
+    assert single_out.from_address == wallet.lower()
+    assert single_out.to_address == counterparty.lower()
 
     batch_transfers = sorted(
         (t for t in transfers if t.source_event == "TransferBatch"),
-        key=lambda t: t.position_id,
+        key=lambda t: (t.tx_hash, t.position_id),
     )
-    assert [t.position_id for t in batch_transfers] == [1, 2]
-    assert [t.amount for t in batch_transfers] == [100, 200]
-    assert all(t.tx_hash == "0xbatch" for t in batch_transfers)
-    assert all(t.log_index == 1 for t in batch_transfers)
-    assert all(t.block_number == 22 for t in batch_transfers)
-    assert all(t.from_address == wallet.lower() for t in batch_transfers)
-    assert all(t.to_address == counterparty.lower() for t in batch_transfers)
+    assert [(t.tx_hash, t.position_id, t.amount) for t in batch_transfers] == [
+        ("0xbatch-in", 3, 300),
+        ("0xbatch-out", 1, 100),
+        ("0xbatch-out", 2, 200),
+    ]
+    batch_in = next(t for t in batch_transfers if t.tx_hash == "0xbatch-in")
+    assert batch_in.from_address == counterparty.lower()
+    assert batch_in.to_address == wallet.lower()
+    for batch_out in (t for t in batch_transfers if t.tx_hash == "0xbatch-out"):
+        assert batch_out.from_address == wallet.lower()
+        assert batch_out.to_address == counterparty.lower()
+        assert batch_out.block_number == 22
+        assert batch_out.log_index == 1
