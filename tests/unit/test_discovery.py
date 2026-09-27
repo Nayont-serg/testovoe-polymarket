@@ -119,6 +119,40 @@ async def test_fetch_wallet_logs_bisects_wide_chunk_that_exceeds_provider_cap() 
     assert logs == [found_log]
 
 
+class TaskCountingFakeClient:
+    def __init__(self) -> None:
+        self.max_tasks_observed = 0
+
+    async def call(
+        self, _kind: str, _method: str, params: list[dict[str, Any]]
+    ) -> list[dict[str, Any]]:
+        self.max_tasks_observed = max(self.max_tasks_observed, len(asyncio.all_tasks()))
+        from_block = int(params[0]["fromBlock"], 16)
+        to_block = int(params[0]["toBlock"], 16)
+        if from_block == to_block:
+            return []
+        raise LogQueryTooLargeError(
+            "Query returned more than 20000 results. Try with this block range [0x0, 0x1]"
+        )
+
+
+async def test_fetch_wallet_logs_bounds_live_task_count_during_deep_bisection() -> None:
+    client = TaskCountingFakeClient()
+    worker_count = 4
+    limiter = AdaptiveConcurrencyLimiter(worker_count, worker_count, worker_count, 180)
+    logs = await _fetch_wallet_logs(
+        client,
+        limiter,
+        "0xusdc",
+        [TRANSFER_TOPIC, None, None],
+        start_block=0,
+        end_block=999,
+        window=1000,
+    )
+    assert logs == []
+    assert client.max_tasks_observed <= worker_count + 2
+
+
 class FakeClient:
     def __init__(self, logs_by_direction: dict[int, list[dict[str, Any]]]) -> None:
         self._logs_by_direction = logs_by_direction

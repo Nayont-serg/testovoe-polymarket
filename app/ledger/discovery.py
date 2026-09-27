@@ -50,6 +50,10 @@ class AdaptiveConcurrencyLimiter:
     def degrade(self, seconds: float) -> None:
         self._degraded_until = self._clock() + seconds
 
+    @property
+    def max_limit(self) -> int:
+        return self._max_limit
+
     async def acquire(self) -> None:
         while True:
             async with self._lock:
@@ -93,43 +97,53 @@ async def _fetch_wallet_logs(
     end_block: int,
     window: int,
 ) -> list[RpcLog]:
-    async def fetch_range(chunk_start: int, chunk_end: int) -> list[RpcLog]:
-        await limiter.acquire()
-        try:
-            return await client.call(
-                "log",
-                "eth_getLogs",
-                [
-                    {
-                        "address": contract_address,
-                        "topics": topics,
-                        "fromBlock": hex(chunk_start),
-                        "toBlock": hex(chunk_end),
-                    }
-                ],
-            )
-        finally:
-            await limiter.release()
+    # A bounded worker pool draining a queue of cheap (start, end) tuples, rather than
+    # recursive fan-out: recursive asyncio.gather bisection creates a live Task per
+    # bisection-tree node gated only by its parent's HTTP call completing, not by the
+    # limiter, so live task objects can pile up far faster than the limiter drains them
+    # via real HTTP calls once a chunk needs many levels of bisection.
+    queue: asyncio.Queue[tuple[int, int]] = asyncio.Queue()
+    for chunk_start, chunk_end in block_chunks(start_block, end_block, window):
+        queue.put_nowait((chunk_start, chunk_end))
 
-    async def fetch_chunk(chunk_start: int, chunk_end: int) -> list[RpcLog]:
-        try:
-            return await fetch_range(chunk_start, chunk_end)
-        except LogQueryTooLargeError:
-            if chunk_start == chunk_end:
-                raise
-            # Slot for the failed attempt is already released above: holding it across the
-            # bisection would let concurrently-held ancestor slots starve out their own children.
-            mid = (chunk_start + chunk_end) // 2
-            left, right = await asyncio.gather(
-                fetch_chunk(chunk_start, mid), fetch_chunk(mid + 1, chunk_end)
-            )
-            return left + right
+    results: list[RpcLog] = []
 
-    chunks = block_chunks(start_block, end_block, window)
-    results = await asyncio.gather(
-        *(fetch_chunk(chunk_start, chunk_end) for chunk_start, chunk_end in chunks)
-    )
-    return [log for chunk_logs in results for log in chunk_logs]
+    async def worker() -> None:
+        while True:
+            try:
+                chunk_start, chunk_end = queue.get_nowait()
+            except asyncio.QueueEmpty:
+                return
+            await limiter.acquire()
+            try:
+                logs = await client.call(
+                    "log",
+                    "eth_getLogs",
+                    [
+                        {
+                            "address": contract_address,
+                            "topics": topics,
+                            "fromBlock": hex(chunk_start),
+                            "toBlock": hex(chunk_end),
+                        }
+                    ],
+                )
+                results.extend(logs)
+            except LogQueryTooLargeError:
+                if chunk_start == chunk_end:
+                    raise
+                mid = (chunk_start + chunk_end) // 2
+                queue.put_nowait((chunk_start, mid))
+                queue.put_nowait((mid + 1, chunk_end))
+            finally:
+                await limiter.release()
+
+    workers = [asyncio.create_task(worker()) for _ in range(limiter.max_limit)]
+    errors = await asyncio.gather(*workers, return_exceptions=True)
+    for error in errors:
+        if isinstance(error, BaseException):
+            raise error
+    return results
 
 
 async def discover_erc20_transfers(
