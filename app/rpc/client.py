@@ -19,8 +19,8 @@ class LogQueryTooLargeError(Exception):
 
 
 def _is_log_query_too_large(error: dict[str, object]) -> bool:
-    message = str(error.get("message", "")).lower()
-    return "query returned more than" in message and "results" in message
+    haystack = f"{error.get('message', '')} {error.get('data', '')}".lower()
+    return "query returned more than" in haystack and "results" in haystack
 
 
 class JsonRpcClient:

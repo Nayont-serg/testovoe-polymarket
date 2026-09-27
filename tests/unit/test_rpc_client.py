@@ -143,6 +143,39 @@ async def test_call_raises_log_query_too_large_without_trying_second_url() -> No
 
 
 @respx.mock
+async def test_call_raises_log_query_too_large_when_detail_is_in_data_field() -> None:
+    route_a = respx.post("https://a.example").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "jsonrpc": "2.0",
+                "id": 1,
+                "error": {
+                    "code": -32602,
+                    "message": "invalid params",
+                    "data": "Query returned more than 20000 results. Try with this "
+                    "block range [0x0, 0x1].",
+                },
+            },
+        )
+    )
+    route_b = respx.post("https://b.example").mock(
+        return_value=httpx.Response(200, json={"jsonrpc": "2.0", "id": 1, "result": []})
+    )
+    client = JsonRpcClient(
+        urls_by_kind={"log": ("https://a.example", "https://b.example")},
+        timeout_seconds=5,
+        keepalive_timeout_seconds=5,
+        rate_limit_cooldown_seconds=30.0,
+    )
+    with pytest.raises(LogQueryTooLargeError):
+        await client.call("log", "eth_getLogs", [])
+    assert route_a.call_count == 1
+    assert route_b.call_count == 0
+    await client.aclose()
+
+
+@respx.mock
 async def test_batch_call_raises_when_response_missing_requested_id() -> None:
     respx.post("https://a.example").mock(
         return_value=httpx.Response(
