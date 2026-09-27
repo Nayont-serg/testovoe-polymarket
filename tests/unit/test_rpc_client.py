@@ -2,7 +2,7 @@ import httpx
 import pytest
 import respx
 
-from app.rpc.client import JsonRpcClient, RpcAllEndpointsExhaustedError
+from app.rpc.client import JsonRpcClient, LogQueryTooLargeError, RpcAllEndpointsExhaustedError
 
 
 def make_client(urls: list[str], cooldown: float = 30.0) -> JsonRpcClient:
@@ -107,6 +107,38 @@ async def test_batch_call_falls_back_to_next_url_when_item_has_error() -> None:
         "call", [("eth_getBlockByNumber", ["0x1"]), ("eth_getBlockByNumber", ["0x2"])]
     )
     assert results == ["0x1", "0x2"]
+    await client.aclose()
+
+
+@respx.mock
+async def test_call_raises_log_query_too_large_without_trying_second_url() -> None:
+    route_a = respx.post("https://a.example").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "jsonrpc": "2.0",
+                "id": 1,
+                "error": {
+                    "code": -32602,
+                    "message": "Query returned more than 20000 results. Try with this "
+                    "block range [0x0, 0x1]",
+                },
+            },
+        )
+    )
+    route_b = respx.post("https://b.example").mock(
+        return_value=httpx.Response(200, json={"jsonrpc": "2.0", "id": 1, "result": []})
+    )
+    client = JsonRpcClient(
+        urls_by_kind={"log": ("https://a.example", "https://b.example")},
+        timeout_seconds=5,
+        keepalive_timeout_seconds=5,
+        rate_limit_cooldown_seconds=30.0,
+    )
+    with pytest.raises(LogQueryTooLargeError):
+        await client.call("log", "eth_getLogs", [])
+    assert route_a.call_count == 1
+    assert route_b.call_count == 0
     await client.aclose()
 
 

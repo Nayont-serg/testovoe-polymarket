@@ -13,6 +13,16 @@ class RpcAllEndpointsExhaustedError(Exception):
         super().__init__(f"all {kind} RPC endpoints failed for {method}")
 
 
+class LogQueryTooLargeError(Exception):
+    def __init__(self, message: str) -> None:
+        super().__init__(message)
+
+
+def _is_log_query_too_large(error: dict[str, object]) -> bool:
+    message = str(error.get("message", "")).lower()
+    return "query returned more than" in message and "results" in message
+
+
 class JsonRpcClient:
     def __init__(
         self,
@@ -55,6 +65,8 @@ class JsonRpcClient:
                 last_error = exc
                 continue
             if "error" in body:
+                if _is_log_query_too_large(body["error"]):
+                    raise LogQueryTooLargeError(str(body["error"]))
                 last_error = RuntimeError(body["error"])
                 continue
             return body["result"]

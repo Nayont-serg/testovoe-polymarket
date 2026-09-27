@@ -6,7 +6,7 @@ from collections.abc import Callable
 from typing import Any
 
 from app.ledger.models import Asset, RawTransfer
-from app.rpc.client import JsonRpcClient
+from app.rpc.client import JsonRpcClient, LogQueryTooLargeError
 from app.rpc.codec import (
     TRANSFER_BATCH_TOPIC,
     TRANSFER_SINGLE_TOPIC,
@@ -93,7 +93,7 @@ async def _fetch_wallet_logs(
     end_block: int,
     window: int,
 ) -> list[RpcLog]:
-    async def fetch_chunk(chunk_start: int, chunk_end: int) -> list[RpcLog]:
+    async def fetch_range(chunk_start: int, chunk_end: int) -> list[RpcLog]:
         await limiter.acquire()
         try:
             return await client.call(
@@ -110,6 +110,20 @@ async def _fetch_wallet_logs(
             )
         finally:
             await limiter.release()
+
+    async def fetch_chunk(chunk_start: int, chunk_end: int) -> list[RpcLog]:
+        try:
+            return await fetch_range(chunk_start, chunk_end)
+        except LogQueryTooLargeError:
+            if chunk_start == chunk_end:
+                raise
+            # Slot for the failed attempt is already released above: holding it across the
+            # bisection would let concurrently-held ancestor slots starve out their own children.
+            mid = (chunk_start + chunk_end) // 2
+            left, right = await asyncio.gather(
+                fetch_chunk(chunk_start, mid), fetch_chunk(mid + 1, chunk_end)
+            )
+            return left + right
 
     chunks = block_chunks(start_block, end_block, window)
     results = await asyncio.gather(

@@ -3,11 +3,13 @@ from typing import Any
 
 from app.ledger.discovery import (
     AdaptiveConcurrencyLimiter,
+    _fetch_wallet_logs,
     block_chunks,
     discover_ctf_transfers,
     discover_erc20_transfers,
 )
 from app.ledger.models import Asset
+from app.rpc.client import LogQueryTooLargeError
 from app.rpc.codec import (
     TRANSFER_BATCH_TOPIC,
     TRANSFER_SINGLE_TOPIC,
@@ -79,6 +81,42 @@ async def test_acquire_blocks_at_limit_and_release_frees_slot() -> None:
     await limiter.release()
     await asyncio.wait_for(task, timeout=1)
     assert acquired_second is True
+
+
+class BisectingFakeClient:
+    def __init__(self, threshold: int, found_log: dict[str, Any], found_block: int) -> None:
+        self._threshold = threshold
+        self._found_log = found_log
+        self._found_block = found_block
+
+    async def call(
+        self, _kind: str, _method: str, params: list[dict[str, Any]]
+    ) -> list[dict[str, Any]]:
+        from_block = int(params[0]["fromBlock"], 16)
+        to_block = int(params[0]["toBlock"], 16)
+        if to_block - from_block > self._threshold:
+            raise LogQueryTooLargeError(
+                "Query returned more than 20000 results. Try with this block range [0x0, 0x1]"
+            )
+        if from_block <= self._found_block <= to_block:
+            return [self._found_log]
+        return []
+
+
+async def test_fetch_wallet_logs_bisects_wide_chunk_that_exceeds_provider_cap() -> None:
+    found_log = {"blockNumber": hex(750), "transactionHash": "0xfound", "logIndex": "0x0"}
+    client = BisectingFakeClient(threshold=10, found_log=found_log, found_block=750)
+    limiter = AdaptiveConcurrencyLimiter(2, 60, 100, 180)
+    logs = await _fetch_wallet_logs(
+        client,
+        limiter,
+        "0xusdc",
+        [TRANSFER_TOPIC, None, None],
+        start_block=0,
+        end_block=999,
+        window=1000,
+    )
+    assert logs == [found_log]
 
 
 class FakeClient:
