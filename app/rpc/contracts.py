@@ -37,6 +37,7 @@ COLLATERAL_ASSETS: tuple[Asset, ...] = (
 COLLATERAL_DEPLOY_BLOCKS: dict[str, int] = {
     "0x2791bca1f2de4661ed88a30c99a7a9449aa84174": 5_013_591,
     "0x3c499c542cef5e3811e1192ce70d8cc03d5c3359": 45_319_261,
+    "0xc011a7e12a19f7b1f670d46f03b03f3342e82dfb": 84_902_320,
 }
 
 LABEL_CONTRACTS: dict[str, str] = {
