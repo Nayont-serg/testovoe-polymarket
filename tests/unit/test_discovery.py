@@ -4,10 +4,16 @@ from typing import Any
 from app.ledger.discovery import (
     AdaptiveConcurrencyLimiter,
     block_chunks,
+    discover_ctf_transfers,
     discover_erc20_transfers,
 )
 from app.ledger.models import Asset
-from app.rpc.codec import TRANSFER_TOPIC, address_topic
+from app.rpc.codec import (
+    TRANSFER_BATCH_TOPIC,
+    TRANSFER_SINGLE_TOPIC,
+    TRANSFER_TOPIC,
+    address_topic,
+)
 
 
 def test_block_chunks_splits_full_range_into_fixed_windows() -> None:
@@ -115,3 +121,90 @@ async def test_discover_erc20_transfers_merges_in_and_out_and_decodes() -> None:
     amounts = sorted(t.amount for t in transfers)
     assert amounts == [500, 700]
     assert {t.tx_hash for t in transfers} == {"0xout", "0xin"}
+
+
+def _encode_transfer_batch_data(position_ids: list[int], amounts: list[int]) -> str:
+    ids_offset = 64
+    values_offset = ids_offset + 32 * (1 + len(position_ids))
+    words = [
+        format(ids_offset, "064x"),
+        format(values_offset, "064x"),
+        format(len(position_ids), "064x"),
+        *(format(position_id, "064x") for position_id in position_ids),
+        format(len(amounts), "064x"),
+        *(format(amount, "064x") for amount in amounts),
+    ]
+    return "0x" + "".join(words)
+
+
+class FakeCtfClient:
+    def __init__(self, single_in_log: dict[str, Any], batch_out_log: dict[str, Any]) -> None:
+        self._single_in_log = single_in_log
+        self._batch_out_log = batch_out_log
+
+    async def call(
+        self, _kind: str, _method: str, params: list[dict[str, Any]]
+    ) -> list[dict[str, Any]]:
+        topics = params[0]["topics"]
+        is_out_query = topics[2] is not None
+        if topics[0] == TRANSFER_SINGLE_TOPIC:
+            return [] if is_out_query else [self._single_in_log]
+        if topics[0] == TRANSFER_BATCH_TOPIC:
+            return [self._batch_out_log] if is_out_query else []
+        raise AssertionError(f"unexpected topic0 {topics[0]}")
+
+
+async def test_discover_ctf_transfers_merges_single_and_batch_and_explodes_pairs() -> None:
+    wallet = "0x46b353667fd7d846af3bbeda6584b0e5b883d3de"
+    counterparty = "0x9999999999999999999999999999999999999999"
+    operator = "0x8888888888888888888888888888888888888888"
+    single_in_log = {
+        "topics": [
+            TRANSFER_SINGLE_TOPIC,
+            address_topic(operator),
+            address_topic(counterparty),
+            address_topic(wallet),
+        ],
+        "data": "0x" + format(42, "064x") + format(7, "064x"),
+        "blockNumber": hex(11),
+        "transactionHash": "0xsingle",
+        "logIndex": "0x0",
+    }
+    batch_out_log = {
+        "topics": [
+            TRANSFER_BATCH_TOPIC,
+            address_topic(operator),
+            address_topic(wallet),
+            address_topic(counterparty),
+        ],
+        "data": _encode_transfer_batch_data([1, 2], [100, 200]),
+        "blockNumber": hex(22),
+        "transactionHash": "0xbatch",
+        "logIndex": "0x1",
+    }
+    client = FakeCtfClient(single_in_log, batch_out_log)
+    limiter = AdaptiveConcurrencyLimiter(2, 60, 100, 180)
+    transfers = await discover_ctf_transfers(
+        client, limiter, "0xctf", wallet, start_block=0, end_block=100, window=1000
+    )
+
+    single_transfers = [t for t in transfers if t.source_event == "TransferSingle"]
+    assert len(single_transfers) == 1
+    single_transfer = single_transfers[0]
+    assert single_transfer.position_id == 42
+    assert single_transfer.amount == 7
+    assert single_transfer.from_address == counterparty.lower()
+    assert single_transfer.to_address == wallet.lower()
+    assert single_transfer.tx_hash == "0xsingle"
+
+    batch_transfers = sorted(
+        (t for t in transfers if t.source_event == "TransferBatch"),
+        key=lambda t: t.position_id,
+    )
+    assert [t.position_id for t in batch_transfers] == [1, 2]
+    assert [t.amount for t in batch_transfers] == [100, 200]
+    assert all(t.tx_hash == "0xbatch" for t in batch_transfers)
+    assert all(t.log_index == 1 for t in batch_transfers)
+    assert all(t.block_number == 22 for t in batch_transfers)
+    assert all(t.from_address == wallet.lower() for t in batch_transfers)
+    assert all(t.to_address == counterparty.lower() for t in batch_transfers)
