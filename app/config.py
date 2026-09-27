@@ -38,17 +38,12 @@ class Settings:
             receipt_rpc_urls=tuple(source["RECEIPT_RPC_URLS"].split(",")),
             call_rpc_urls=tuple(source["CALL_RPC_URLS"].split(",")),
             rpc_timeout_seconds=float(source.get("RPC_TIMEOUT_SECONDS", "90")),
-            rpc_keepalive_timeout_seconds=float(
-                source.get("RPC_KEEPALIVE_TIMEOUT_SECONDS", "120")
-            ),
+            rpc_keepalive_timeout_seconds=float(source.get("RPC_KEEPALIVE_TIMEOUT_SECONDS", "120")),
             receipt_rpc_rate_limit_cooldown_seconds=float(
                 source.get("RECEIPT_RPC_RATE_LIMIT_COOLDOWN_SECONDS", "30")
             ),
-            receipt_rpc_use_proxy=source.get("RECEIPT_RPC_USE_PROXY", "false").lower()
-            == "true",
-            free_log_rpc_window_blocks=int(
-                source.get("FREE_LOG_RPC_WINDOW_BLOCKS", "200000")
-            ),
+            receipt_rpc_use_proxy=source.get("RECEIPT_RPC_USE_PROXY", "false").lower() == "true",
+            free_log_rpc_window_blocks=int(source.get("FREE_LOG_RPC_WINDOW_BLOCKS", "200000")),
             goldsky_raw_log_rpc_concurrency_min=int(
                 source.get("GOLDSKY_RAW_LOG_RPC_CONCURRENCY_MIN", "2")
             ),
@@ -67,9 +62,7 @@ class Settings:
             w3_free_receipt_loading_batch_size=int(
                 source.get("W3_FREE_RECEIPT_LOADING_BATCH_SIZE", "1400")
             ),
-            w3_free_receipt_rpc_batch_size=int(
-                source.get("W3_FREE_RECEIPT_RPC_BATCH_SIZE", "500")
-            ),
+            w3_free_receipt_rpc_batch_size=int(source.get("W3_FREE_RECEIPT_RPC_BATCH_SIZE", "500")),
             w3_block_timestamps_loading_batch_size=int(
                 source.get("W3_BLOCK_TIMESTAMPS_LOADING_BATCH_SIZE", "2000")
             ),

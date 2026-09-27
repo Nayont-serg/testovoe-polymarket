@@ -33,9 +33,7 @@ class JsonRpcClient:
     def _available_urls(self, kind: RpcKind) -> list[str]:
         now = time.monotonic()
         urls = [
-            url
-            for url in self._urls_by_kind[kind]
-            if self._cooldown_until.get(url, 0.0) <= now
+            url for url in self._urls_by_kind[kind] if self._cooldown_until.get(url, 0.0) <= now
         ]
         return urls or list(self._urls_by_kind[kind])
 
@@ -43,9 +41,7 @@ class JsonRpcClient:
         response = await self._http.post(url, json=payload)
         if response.status_code == 429:
             self._cooldown_until[url] = time.monotonic() + self._cooldown_seconds
-            raise httpx.HTTPStatusError(
-                "rate limited", request=response.request, response=response
-            )
+            raise httpx.HTTPStatusError("rate limited", request=response.request, response=response)
         response.raise_for_status()
         return response.json()
 
@@ -64,9 +60,7 @@ class JsonRpcClient:
             return body["result"]
         raise RpcAllEndpointsExhaustedError(kind, method) from last_error
 
-    async def batch_call(
-        self, kind: RpcKind, requests: list[tuple[str, list[Any]]]
-    ) -> list[Any]:
+    async def batch_call(self, kind: RpcKind, requests: list[tuple[str, list[Any]]]) -> list[Any]:
         payload = [
             {"jsonrpc": "2.0", "id": index, "method": method, "params": params}
             for index, (method, params) in enumerate(requests)
@@ -78,21 +72,12 @@ class JsonRpcClient:
             except httpx.HTTPError as exc:
                 last_error = exc
                 continue
-            errors = [
-                response_item["error"]
-                for response_item in body
-                if "error" in response_item
-            ]
+            errors = [response_item["error"] for response_item in body if "error" in response_item]
             if errors:
                 last_error = RuntimeError(errors[0])
                 continue
-            by_id = {
-                response_item["id"]: response_item.get("result")
-                for response_item in body
-            }
-            missing_ids = [
-                index for index in range(len(requests)) if index not in by_id
-            ]
+            by_id = {response_item["id"]: response_item.get("result") for response_item in body}
+            missing_ids = [index for index in range(len(requests)) if index not in by_id]
             if missing_ids:
                 last_error = RuntimeError(f"batch response missing ids {missing_ids}")
                 continue

@@ -1,7 +1,7 @@
 from app.ledger.models import Asset, RawTransfer
 
 
-def test_asset_erc20_has_no_position_id():
+def test_asset_erc20_has_no_position_id() -> None:
     asset = Asset(
         kind="erc20",
         contract_address="0xusdc",
@@ -12,7 +12,7 @@ def test_asset_erc20_has_no_position_id():
     assert asset.position_id is None
 
 
-def test_raw_transfer_holds_decoded_log_fields():
+def test_raw_transfer_holds_decoded_log_fields() -> None:
     transfer = RawTransfer(
         contract_address="0xctf",
         source_event="TransferSingle",

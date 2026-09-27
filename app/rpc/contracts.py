@@ -49,9 +49,7 @@ LABEL_CONTRACTS: dict[str, str] = {
 }
 
 
-async def resolve_deploy_block(
-    client: JsonRpcClient, address: str, latest_block: int
-) -> int:
+async def resolve_deploy_block(client: JsonRpcClient, address: str, latest_block: int) -> int:
     async def has_code(block: int) -> bool:
         code = await client.call("call", "eth_getCode", [address, hex(block)])
         return code not in ("0x", "0x0", None)

@@ -1,7 +1,7 @@
 from app.config import Settings
 
 
-def test_settings_from_env_parses_comma_separated_url_lists():
+def test_settings_from_env_parses_comma_separated_url_lists() -> None:
     env = {
         "DATABASE_URL": "postgresql://u:p@localhost:5433/db",
         "LOG_RPC_URLS": "https://a.example,https://b.example",
@@ -15,7 +15,7 @@ def test_settings_from_env_parses_comma_separated_url_lists():
     assert settings.wallet_address == "0x46b353667fd7d846af3bbeda6584b0e5b883d3de"
 
 
-def test_settings_from_env_applies_numeric_defaults():
+def test_settings_from_env_applies_numeric_defaults() -> None:
     env = {
         "DATABASE_URL": "postgresql://u:p@localhost:5433/db",
         "LOG_RPC_URLS": "https://a.example",

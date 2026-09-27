@@ -1,9 +1,10 @@
+import asyncpg
 import pytest
 
 pytestmark = pytest.mark.integration
 
 
-async def test_migrations_create_expected_tables(pool):
+async def test_migrations_create_expected_tables(pool: asyncpg.Pool) -> None:
     async with pool.acquire() as connection:
         rows = await connection.fetch(
             "SELECT table_name FROM information_schema.tables WHERE table_schema='public'"

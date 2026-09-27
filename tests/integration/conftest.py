@@ -1,4 +1,5 @@
 import os
+from collections.abc import AsyncIterator
 
 import asyncpg
 import pytest
@@ -14,13 +15,14 @@ def database_url() -> str:
 
 
 @pytest.fixture
-async def pool():
+async def pool() -> AsyncIterator[asyncpg.Pool]:
     url = database_url()
     await apply_migrations(url)
     connection_pool = await asyncpg.create_pool(url, min_size=1, max_size=5)
     yield connection_pool
     async with connection_pool.acquire() as connection:
         await connection.execute(
-            "TRUNCATE balance_checks, index_checkpoints, balance_events, assets, wallets RESTART IDENTITY CASCADE"
+            "TRUNCATE balance_checks, index_checkpoints, balance_events, assets, "
+            "wallets RESTART IDENTITY CASCADE"
         )
     await connection_pool.close()
