@@ -10,7 +10,7 @@ from app.ledger.discovery import (
     discover_erc20_transfers,
 )
 from app.ledger.enrichment import build_ledger_entry, fetch_block_timestamps, fetch_receipts
-from app.ledger.models import Asset, BalanceCheckResult, RawTransfer
+from app.ledger.models import Asset, BalanceCheckResult, LedgerEntry, RawTransfer
 from app.ledger.reconciliation import reconcile_asset
 from app.rpc import contracts
 from app.rpc.client import JsonRpcClient
@@ -110,19 +110,45 @@ class LedgerService:
             self._settings.free_log_rpc_window_blocks,
         )
         assets_by_position: dict[int, Asset] = {}
+        asset_ids_by_position: dict[int, int] = {}
         for transfer in transfers:
-            asset = assets_by_position.setdefault(
-                transfer.position_id,
-                Asset(
+            if transfer.position_id not in assets_by_position:
+                asset = Asset(
                     kind="erc1155",
                     contract_address=contracts.CTF_ADDRESS,
                     position_id=transfer.position_id,
                     symbol=None,
                     decimals=0,
-                ),
+                )
+                assets_by_position[transfer.position_id] = asset
+                asset_ids_by_position[transfer.position_id] = await self._repository.ensure_asset(
+                    asset
+                )
+
+        if transfers:
+            tx_hashes = list({t.tx_hash for t in transfers})
+            receipts = await fetch_receipts(
+                self._client, tx_hashes, self._settings.w3_free_receipt_rpc_batch_size
             )
-            asset_id = await self._repository.ensure_asset(asset)
-            await self._persist_transfers(asset, asset_id, wallet_address, [transfer])
+            block_numbers = list({t.block_number for t in transfers})
+            timestamps = await fetch_block_timestamps(
+                self._client, block_numbers, self._settings.w3_block_timestamps_rpc_batch_size
+            )
+            entries_by_asset_id: dict[int, list[LedgerEntry]] = {}
+            for transfer in transfers:
+                asset = assets_by_position[transfer.position_id]
+                asset_id = asset_ids_by_position[transfer.position_id]
+                entry = build_ledger_entry(
+                    transfer,
+                    asset,
+                    wallet_address,
+                    receipts[transfer.tx_hash],
+                    timestamps[transfer.block_number],
+                )
+                entries_by_asset_id.setdefault(asset_id, []).append(entry)
+            for asset_id, entries in entries_by_asset_id.items():
+                await self._repository.upsert_events(asset_id, entries)
+
         await self._repository.set_checkpoint(wallet_address, checkpoint_asset_id, latest_block)
         return list(assets_by_position.values())
 

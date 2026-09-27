@@ -4,6 +4,7 @@ import pytest
 
 from app.ledger.models import Asset, BalanceCheckResult, LedgerEntry
 from app.ledger.service import LedgerReport, LedgerService
+from app.rpc.codec import TRANSFER_SINGLE_TOPIC, address_topic
 
 
 def test_ledger_report_all_matched_true_when_every_check_matches() -> None:
@@ -157,3 +158,79 @@ async def test_ledger_service_run_produces_matched_report_for_single_asset(
     report = await service.run(wallet)
     assert report.all_matched is True
     assert len(report.balance_checks) == 1
+
+
+class FakeCtfClient:
+    def __init__(self, wallet: str, single_incoming_logs: list[dict[str, Any]]) -> None:
+        self._wallet = wallet
+        self._single_incoming_logs = single_incoming_logs
+        self.batch_calls: list[tuple[str, list[Any]]] = []
+
+    async def call(self, _kind: str, method: str, params: list[Any]) -> Any:
+        if method == "eth_blockNumber":
+            return hex(10)
+        if method == "eth_getLogs":
+            topics = params[0]["topics"]
+            if topics[0] == TRANSFER_SINGLE_TOPIC and topics[3] is not None:
+                return self._single_incoming_logs
+            return []
+        if method == "eth_call":
+            return "0x" + format(0, "064x")
+        raise AssertionError(method)
+
+    async def batch_call(self, kind: str, requests: list[Any]) -> list[Any]:
+        self.batch_calls.append((kind, requests))
+        if kind == "receipt":
+            return [{"logs": []} for _ in requests]
+        return [{"timestamp": hex(1_700_000_000)} for _ in requests]
+
+
+async def test_ledger_service_process_ctf_batches_receipts_and_timestamps_across_positions(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app.rpc import contracts
+
+    wallet = "0x46b353667fd7d846af3bbeda6584b0e5b883d3de"
+    counterparty = "0x9999999999999999999999999999999999999999"
+    monkeypatch.setattr(contracts, "COLLATERAL_ASSETS", ())
+    monkeypatch.setattr(contracts, "CTF_DEPLOY_BLOCK", 0)
+
+    single_in_position_1 = {
+        "topics": [
+            TRANSFER_SINGLE_TOPIC,
+            address_topic(counterparty),
+            address_topic(counterparty),
+            address_topic(wallet),
+        ],
+        "data": "0x" + format(1, "064x") + format(500, "064x"),
+        "blockNumber": hex(9),
+        "transactionHash": "0xctf1",
+        "logIndex": "0x0",
+    }
+    single_in_position_2 = {
+        "topics": [
+            TRANSFER_SINGLE_TOPIC,
+            address_topic(counterparty),
+            address_topic(counterparty),
+            address_topic(wallet),
+        ],
+        "data": "0x" + format(2, "064x") + format(300, "064x"),
+        "blockNumber": hex(11),
+        "transactionHash": "0xctf2",
+        "logIndex": "0x0",
+    }
+
+    client = FakeCtfClient(wallet, [single_in_position_1, single_in_position_2])
+    repository = FakeRepository()
+    service = LedgerService(client, repository, FakeSettings())
+    report = await service.run(wallet)
+
+    assert len(report.balance_checks) == 2
+    assert len(repository.events) == 2
+
+    receipt_calls = [requests for kind, requests in client.batch_calls if kind == "receipt"]
+    timestamp_calls = [requests for kind, requests in client.batch_calls if kind != "receipt"]
+    assert len(receipt_calls) == 1
+    assert len(receipt_calls[0]) == 2
+    assert len(timestamp_calls) == 1
+    assert len(timestamp_calls[0]) == 2

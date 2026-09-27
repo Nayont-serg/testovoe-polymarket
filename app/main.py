@@ -39,24 +39,26 @@ async def run(wallet_address: str | None) -> bool:
         keepalive_timeout_seconds=settings.rpc_keepalive_timeout_seconds,
         rate_limit_cooldown_seconds=settings.receipt_rpc_rate_limit_cooldown_seconds,
     )
-    pool = await create_pool(settings.database_url)
     try:
-        repository = LedgerRepository(pool)
-        service = LedgerService(client, repository, settings)
-        report = await service.run(address)
-        for check in report.balance_checks:
-            label = check.asset.symbol or f"position:{check.asset.position_id}"
-            status = "OK" if check.matched else "MISMATCH"
-            logger.info(
-                "[%s] %s: computed=%s onchain=%s",
-                status,
-                label,
-                check.computed_balance,
-                check.onchain_balance,
-            )
-        return report.all_matched
+        pool = await create_pool(settings.database_url)
+        try:
+            repository = LedgerRepository(pool)
+            service = LedgerService(client, repository, settings)
+            report = await service.run(address)
+            for check in report.balance_checks:
+                label = check.asset.symbol or f"position:{check.asset.position_id}"
+                status = "OK" if check.matched else "MISMATCH"
+                logger.info(
+                    "[%s] %s: computed=%s onchain=%s",
+                    status,
+                    label,
+                    check.computed_balance,
+                    check.onchain_balance,
+                )
+            return report.all_matched
+        finally:
+            await pool.close()
     finally:
-        await pool.close()
         await client.aclose()
 
 
