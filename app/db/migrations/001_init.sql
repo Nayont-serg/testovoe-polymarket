@@ -10,7 +10,7 @@ CREATE TABLE IF NOT EXISTS assets (
     position_id     NUMERIC(78, 0),
     symbol          TEXT,
     decimals        SMALLINT,
-    UNIQUE (kind, contract_address, position_id)
+    UNIQUE NULLS NOT DISTINCT (kind, contract_address, position_id)
 );
 
 CREATE TABLE IF NOT EXISTS balance_events (
