@@ -42,8 +42,8 @@ class Settings:
             ),
             free_log_rpc_window_blocks=int(source.get("FREE_LOG_RPC_WINDOW_BLOCKS", "200000")),
             log_rpc_concurrency_min=int(source.get("LOG_RPC_CONCURRENCY_MIN", "2")),
-            log_rpc_concurrency_start=int(source.get("LOG_RPC_CONCURRENCY_START", "60")),
-            log_rpc_concurrency_max=int(source.get("LOG_RPC_CONCURRENCY_MAX", "100")),
+            log_rpc_concurrency_start=int(source.get("LOG_RPC_CONCURRENCY_START", "8")),
+            log_rpc_concurrency_max=int(source.get("LOG_RPC_CONCURRENCY_MAX", "16")),
             log_rpc_concurrency_grow_interval_sec=int(
                 source.get("LOG_RPC_CONCURRENCY_GROW_INTERVAL_SEC", "180")
             ),
