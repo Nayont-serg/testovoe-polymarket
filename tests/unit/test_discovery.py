@@ -1,15 +1,19 @@
 import asyncio
 from typing import Any
 
+import pytest
+
+import app.ledger.discovery as discovery
 from app.ledger.discovery import (
     AdaptiveConcurrencyLimiter,
+    _fetch_chunk,
     _fetch_wallet_logs,
     block_chunks,
     discover_ctf_transfers,
     discover_erc20_transfers,
 )
 from app.ledger.models import Asset
-from app.rpc.client import LogQueryTooLargeError
+from app.rpc.client import LogQueryTooLargeError, RpcAllEndpointsExhaustedError
 from app.rpc.codec import (
     TRANSFER_BATCH_TOPIC,
     TRANSFER_SINGLE_TOPIC,
@@ -151,6 +155,44 @@ async def test_fetch_wallet_logs_bounds_live_task_count_during_deep_bisection() 
     )
     assert logs == []
     assert client.max_tasks_observed <= worker_count + 2
+
+
+class TransientThenSuccessFakeClient:
+    def __init__(self, failures_before_success: int, log: dict[str, Any]) -> None:
+        self._failures_before_success = failures_before_success
+        self._log = log
+        self.call_count = 0
+
+    async def call(
+        self, _kind: str, _method: str, _params: list[dict[str, Any]]
+    ) -> list[dict[str, Any]]:
+        self.call_count += 1
+        if self.call_count <= self._failures_before_success:
+            raise RpcAllEndpointsExhaustedError("log", "eth_getLogs")
+        return [self._log]
+
+
+async def test_fetch_chunk_retries_transient_failure_then_returns_logs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(discovery, "_CHUNK_RETRY_BACKOFF_SECONDS", 0.0)
+    found_log = {"blockNumber": hex(5), "transactionHash": "0xok", "logIndex": "0x0"}
+    client = TransientThenSuccessFakeClient(
+        failures_before_success=discovery._MAX_CHUNK_ATTEMPTS - 1, log=found_log
+    )
+    logs = await _fetch_chunk(client, "0xusdc", [TRANSFER_TOPIC, None, None], 0, 10)
+    assert logs == [found_log]
+    assert client.call_count == discovery._MAX_CHUNK_ATTEMPTS
+
+
+async def test_fetch_chunk_raises_after_exhausting_all_retries(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(discovery, "_CHUNK_RETRY_BACKOFF_SECONDS", 0.0)
+    client = TransientThenSuccessFakeClient(failures_before_success=999, log={})
+    with pytest.raises(RpcAllEndpointsExhaustedError):
+        await _fetch_chunk(client, "0xusdc", [TRANSFER_TOPIC, None, None], 0, 10)
+    assert client.call_count == discovery._MAX_CHUNK_ATTEMPTS
 
 
 class FakeClient:

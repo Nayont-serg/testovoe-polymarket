@@ -6,7 +6,7 @@ from collections.abc import Callable
 from typing import Any
 
 from app.ledger.models import Asset, RawTransfer
-from app.rpc.client import JsonRpcClient, LogQueryTooLargeError
+from app.rpc.client import JsonRpcClient, LogQueryTooLargeError, RpcAllEndpointsExhaustedError
 from app.rpc.codec import (
     TRANSFER_BATCH_TOPIC,
     TRANSFER_SINGLE_TOPIC,
@@ -18,6 +18,9 @@ from app.rpc.codec import (
 )
 
 RpcLog = dict[str, Any]
+
+_MAX_CHUNK_ATTEMPTS = 5
+_CHUNK_RETRY_BACKOFF_SECONDS = 2.0
 
 
 class AdaptiveConcurrencyLimiter:
@@ -88,6 +91,36 @@ def _dedupe_logs(logs: list[RpcLog]) -> list[RpcLog]:
     return unique
 
 
+async def _fetch_chunk(
+    client: JsonRpcClient,
+    contract_address: str,
+    topics: list[str | None],
+    chunk_start: int,
+    chunk_end: int,
+) -> list[RpcLog]:
+    last_error: RpcAllEndpointsExhaustedError | None = None
+    for attempt in range(_MAX_CHUNK_ATTEMPTS):
+        try:
+            return await client.call(
+                "log",
+                "eth_getLogs",
+                [
+                    {
+                        "address": contract_address,
+                        "topics": topics,
+                        "fromBlock": hex(chunk_start),
+                        "toBlock": hex(chunk_end),
+                    }
+                ],
+            )
+        except RpcAllEndpointsExhaustedError as exc:
+            last_error = exc
+            if attempt < _MAX_CHUNK_ATTEMPTS - 1:
+                await asyncio.sleep(_CHUNK_RETRY_BACKOFF_SECONDS * (attempt + 1))
+    assert last_error is not None
+    raise last_error
+
+
 async def _fetch_wallet_logs(
     client: JsonRpcClient,
     limiter: AdaptiveConcurrencyLimiter,
@@ -116,18 +149,7 @@ async def _fetch_wallet_logs(
                 return
             await limiter.acquire()
             try:
-                logs = await client.call(
-                    "log",
-                    "eth_getLogs",
-                    [
-                        {
-                            "address": contract_address,
-                            "topics": topics,
-                            "fromBlock": hex(chunk_start),
-                            "toBlock": hex(chunk_end),
-                        }
-                    ],
-                )
+                logs = await _fetch_chunk(client, contract_address, topics, chunk_start, chunk_end)
                 results.extend(logs)
             except LogQueryTooLargeError:
                 if chunk_start == chunk_end:
