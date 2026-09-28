@@ -1,41 +1,43 @@
 # Polymarket Wallet History
 
-Reconstructs the balance history of a Polymarket wallet on Polygon directly from RPC logs
-(no Polymarket API, no third-party indexer) and checks the computed balance of every asset
-against `balanceOf` on the latest confirmed block.
+Восстанавливает on-chain историю баланса кошелька Polymarket на Polygon напрямую
+из RPC-логов (без API Polymarket, без стороннего индексатора) и проверяет, что
+вычисленный баланс каждого актива совпадает с `balanceOf` на последнем подтверждённом блоке.
 
-## Setup
+## Настройка
 
     cp .env.example .env
     uv sync
     make docker-up
     make migrate
 
-Migrations are not versioned. To reset the schema:
+Миграции не версионируются. Чтобы сбросить схему:
 
     docker compose down -v && make docker-up && make migrate
 
-## Run
+## Запуск
 
-    make run                                                           # WALLET_ADDRESS from .env
-    uv run --env-file .env python -m app.main --wallet-address 0x...   # any other wallet
+    make run                                                           # WALLET_ADDRESS из .env
+    uv run --env-file .env python -m app.main --wallet-address 0x...   # или любой другой кошелёк
 
-Prints one `[OK]` or `[MISMATCH]` line per asset. Exit code is `0` if all balances match,
-`1` otherwise. Progress is stored in Postgres as per-asset checkpoints, so a rerun continues
-from the last scanned block.
+Печатает по одной строке `[OK]`/`[MISMATCH]` на каждый актив. Код выхода `0`, если все
+балансы совпали, иначе `1`. Прогресс хранится в Postgres как чекпоинты по каждому активу,
+поэтому повторный запуск продолжает с последнего просканированного блока.
 
-## Tests
+## Тесты
 
-    make test              # unit tests, no network or DB
-    make test-integration  # needs `make docker-up` and network access
+    make test              # юнит-тесты, без сети и БД
+    make test-integration  # требует `make docker-up` и доступ к сети
 
-Integration tests use a separate `polymarket_wallet_history_test` database (override with
-`TEST_DATABASE_URL`), created automatically.
+Интеграционные тесты используют отдельную БД `polymarket_wallet_history_test`
+(переопределяется через `TEST_DATABASE_URL`), создаётся автоматически.
 
-## Scale
+## Масштаб
 
-The default wallet is a Polymarket proxy with 500k+ USDC.e Transfer events. Free Polygon RPC
-endpoints cap `eth_getLogs` at 20k results per request, so a full scan needs many narrow
-requests and takes a long time. Ranges over the cap are bisected, RPC failures are retried
-with backoff, and each batch is written to Postgres as soon as it is fetched, so memory stays
-flat regardless of history size.
+Кошелёк по умолчанию — прокси-контракт Polymarket с 500k+ событий Transfer по USDC.e.
+Бесплатные Polygon RPC ограничивают `eth_getLogs` 20k результатов на запрос, поэтому
+полный скан требует множества узких запросов и занимает много времени. Диапазоны сверх
+лимита делятся пополам, сбои RPC повторяются с задержкой, каждый батч пишется в Postgres
+сразу после получения — память не растёт с объёмом истории. Для ERC-20 запросы "от кошелька"
+и "на кошелёк" на один и тот же диапазон блоков объединяются в один HTTP-запрос (JSON-RPC
+batch), что вдвое снижает нагрузку на лимитированный по частоте запросов бесплатный RPC.
