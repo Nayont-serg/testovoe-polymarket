@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import time
 from collections.abc import Awaitable, Callable
 from typing import Any
@@ -21,6 +22,7 @@ RpcLog = dict[str, Any]
 
 _MAX_CHUNK_ATTEMPTS = 5
 _CHUNK_RETRY_BACKOFF_SECONDS = 2.0
+_LIMIT_RECHECK_SECONDS = 1.0
 
 
 class AdaptiveConcurrencyLimiter:
@@ -39,7 +41,7 @@ class AdaptiveConcurrencyLimiter:
         self._clock = clock
         self._start_time = clock()
         self._in_flight = 0
-        self._lock = asyncio.Lock()
+        self._condition = asyncio.Condition()
         self._degraded_until: float | None = None
 
     def current_limit(self) -> int:
@@ -58,16 +60,17 @@ class AdaptiveConcurrencyLimiter:
         return self._max_limit
 
     async def acquire(self) -> None:
-        while True:
-            async with self._lock:
-                if self._in_flight < self.current_limit():
-                    self._in_flight += 1
-                    return
-            await asyncio.sleep(0.01)
+        async with self._condition:
+            while self._in_flight >= self.current_limit():
+                # Timed wait: the limit also grows with time and recovers after degrade().
+                with contextlib.suppress(TimeoutError):
+                    await asyncio.wait_for(self._condition.wait(), _LIMIT_RECHECK_SECONDS)
+            self._in_flight += 1
 
     async def release(self) -> None:
-        async with self._lock:
+        async with self._condition:
             self._in_flight -= 1
+            self._condition.notify()
 
 
 def block_chunks(start_block: int, end_block: int, window: int) -> list[tuple[int, int]]:
@@ -128,11 +131,7 @@ async def _fetch_wallet_logs(
     window: int,
     sink: Callable[[list[RpcLog]], Awaitable[None]],
 ) -> None:
-    # A bounded worker pool draining a queue of cheap (start, end) tuples, rather than
-    # recursive fan-out: recursive asyncio.gather bisection creates a live Task per
-    # bisection-tree node gated only by its parent's HTTP call completing, not by the
-    # limiter, so live task objects can pile up far faster than the limiter drains them
-    # via real HTTP calls once a chunk needs many levels of bisection.
+    # Fixed worker pool over a queue keeps task count bounded during deep bisection.
     queue: asyncio.Queue[tuple[int, int]] = asyncio.Queue()
     for chunk_start, chunk_end in block_chunks(start_block, end_block, window):
         queue.put_nowait((chunk_start, chunk_end))

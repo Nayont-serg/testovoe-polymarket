@@ -24,5 +24,5 @@ def test_settings_from_env_applies_numeric_defaults() -> None:
     }
     settings = Settings.from_env(env)
     assert settings.free_log_rpc_window_blocks == 200_000
-    assert settings.goldsky_raw_log_rpc_concurrency_start == 60
-    assert settings.receipt_rpc_use_proxy is False
+    assert settings.log_rpc_concurrency_start == 60
+    assert settings.balance_check_batch_size == 500

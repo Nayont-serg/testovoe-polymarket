@@ -1,11 +1,6 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
-
 from app.ledger.models import Asset
-
-if TYPE_CHECKING:
-    from app.rpc.client import JsonRpcClient
 
 CTF_ADDRESS = "0x4d97dcd97ec945f40cf65f87097ace5ea0476045"
 CTF_DEPLOY_BLOCK = 4_023_686
@@ -47,18 +42,3 @@ LABEL_CONTRACTS: dict[str, str] = {
     "0xe2222d279d744050d28e00520010520000310f59": "TRADE",
     "0xd91e80cf2e7be2e162c6513ced06f1dd0da35296": "TRADE",
 }
-
-
-async def resolve_deploy_block(client: JsonRpcClient, address: str, latest_block: int) -> int:
-    async def has_code(block: int) -> bool:
-        code = await client.call("call", "eth_getCode", [address, hex(block)])
-        return code not in ("0x", "0x0", None)
-
-    low, high = 0, latest_block
-    while low < high:
-        mid = (low + high) // 2
-        if await has_code(mid):
-            high = mid
-        else:
-            low = mid + 1
-    return low

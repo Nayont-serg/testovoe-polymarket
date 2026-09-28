@@ -12,7 +12,7 @@ from app.ledger.discovery import (
 )
 from app.ledger.enrichment import build_ledger_entry, fetch_block_timestamps, fetch_receipts
 from app.ledger.models import Asset, BalanceCheckResult, LedgerEntry, RawTransfer
-from app.ledger.reconciliation import reconcile_asset
+from app.ledger.reconciliation import reconcile_asset, reconcile_assets
 from app.rpc import contracts
 from app.rpc.client import JsonRpcClient
 
@@ -42,19 +42,15 @@ class LedgerService:
         raw_latest_block = int(await self._client.call("call", "eth_blockNumber", []), 16)
         latest_block = raw_latest_block - CONFIRMATION_LAG_BLOCKS
         limiter = AdaptiveConcurrencyLimiter(
-            self._settings.goldsky_raw_log_rpc_concurrency_min,
-            self._settings.goldsky_raw_log_rpc_concurrency_start,
-            self._settings.goldsky_raw_log_rpc_concurrency_max,
-            self._settings.goldsky_raw_log_rpc_concurrency_grow_interval_sec,
+            self._settings.log_rpc_concurrency_min,
+            self._settings.log_rpc_concurrency_start,
+            self._settings.log_rpc_concurrency_max,
+            self._settings.log_rpc_concurrency_grow_interval_sec,
         )
         self._client.on_rate_limited = lambda: limiter.degrade(
             self._client.rate_limit_cooldown_seconds
         )
-        # Caps concurrent receipt/timestamp/DB work separately from limiter's raw-log-fetch
-        # concurrency: a dense on-chain range can keep limiter.max_limit chunk fetches
-        # concurrently alive, and each chunk's persist step can itself hold many full tx
-        # receipts, so gating persist by the same (much larger) limiter let peak memory scale
-        # with max_limit instead of with a small, fixed number of in-flight persists.
+        # Separate cap: each persist holds full receipts, so memory must not scale with log fetches.
         persist_semaphore = asyncio.Semaphore(self._settings.persist_concurrency)
 
         checks: list[BalanceCheckResult] = []
@@ -66,16 +62,14 @@ class LedgerService:
                     limiter,
                     persist_semaphore,
                     latest_block,
-                    default_start_block=contracts.COLLATERAL_DEPLOY_BLOCKS.get(
-                        asset.contract_address, contracts.CTF_DEPLOY_BLOCK
-                    ),
+                    default_start_block=contracts.COLLATERAL_DEPLOY_BLOCKS[asset.contract_address],
                 )
             )
 
-        for asset in await self._process_ctf(
+        ctf_assets = await self._process_ctf(
             wallet_address, limiter, persist_semaphore, latest_block
-        ):
-            checks.append(await self._reconcile(asset, wallet_address, latest_block))
+        )
+        checks.extend(await self._reconcile_positions(ctf_assets, wallet_address, latest_block))
 
         return LedgerReport(balance_checks=checks)
 
@@ -141,19 +135,18 @@ class LedgerService:
                             symbol=None,
                             decimals=0,
                         )
-                        # Concurrent batches may race here; ensure_asset's ON CONFLICT makes it
-                        # benign.
+                        # Concurrent batches may race here; ON CONFLICT in ensure_asset covers it.
                         asset_id = await self._repository.ensure_asset(asset)
                         assets_by_position[transfer.position_id] = asset
                         asset_ids_by_position[transfer.position_id] = asset_id
 
                 tx_hashes = list({t.tx_hash for t in batch})
                 receipts = await fetch_receipts(
-                    self._client, tx_hashes, self._settings.w3_free_receipt_rpc_batch_size
+                    self._client, tx_hashes, self._settings.receipt_rpc_batch_size
                 )
                 block_numbers = list({t.block_number for t in batch})
                 timestamps = await fetch_block_timestamps(
-                    self._client, block_numbers, self._settings.w3_block_timestamps_rpc_batch_size
+                    self._client, block_numbers, self._settings.block_timestamps_rpc_batch_size
                 )
                 entries_by_asset_id: dict[int, list[LedgerEntry]] = {}
                 for transfer in batch:
@@ -195,11 +188,11 @@ class LedgerService:
             return
         tx_hashes = list({t.tx_hash for t in transfers})
         receipts = await fetch_receipts(
-            self._client, tx_hashes, self._settings.w3_free_receipt_rpc_batch_size
+            self._client, tx_hashes, self._settings.receipt_rpc_batch_size
         )
         block_numbers = list({t.block_number for t in transfers})
         timestamps = await fetch_block_timestamps(
-            self._client, block_numbers, self._settings.w3_block_timestamps_rpc_batch_size
+            self._client, block_numbers, self._settings.block_timestamps_rpc_batch_size
         )
         entries = [
             build_ledger_entry(
@@ -217,3 +210,25 @@ class LedgerService:
         result = await reconcile_asset(self._client, wallet_address, asset, computed, latest_block)
         await self._repository.save_balance_check(result, asset_id)
         return result
+
+    async def _reconcile_positions(
+        self, assets: list[Asset], wallet_address: str, latest_block: int
+    ) -> list[BalanceCheckResult]:
+        asset_ids: list[int] = []
+        computed_by_asset: list[tuple[Asset, int]] = []
+        for asset in assets:
+            asset_id = await self._repository.ensure_asset(asset)
+            asset_ids.append(asset_id)
+            computed_by_asset.append(
+                (asset, await self._repository.sum_balance(wallet_address, asset_id))
+            )
+        results = await reconcile_assets(
+            self._client,
+            wallet_address,
+            computed_by_asset,
+            latest_block,
+            self._settings.balance_check_batch_size,
+        )
+        for result, asset_id in zip(results, asset_ids, strict=True):
+            await self._repository.save_balance_check(result, asset_id)
+        return results

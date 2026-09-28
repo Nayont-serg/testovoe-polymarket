@@ -56,12 +56,13 @@ def test_ledger_report_all_matched_false_when_one_check_fails() -> None:
 
 class FakeSettings:
     free_log_rpc_window_blocks = 1000
-    goldsky_raw_log_rpc_concurrency_min = 2
-    goldsky_raw_log_rpc_concurrency_start = 60
-    goldsky_raw_log_rpc_concurrency_max = 100
-    goldsky_raw_log_rpc_concurrency_grow_interval_sec = 180
-    w3_free_receipt_rpc_batch_size = 500
-    w3_block_timestamps_rpc_batch_size = 2000
+    log_rpc_concurrency_min = 2
+    log_rpc_concurrency_start = 60
+    log_rpc_concurrency_max = 100
+    log_rpc_concurrency_grow_interval_sec = 180
+    receipt_rpc_batch_size = 500
+    block_timestamps_rpc_batch_size = 2000
+    balance_check_batch_size = 500
     persist_concurrency = 4
 
 
@@ -178,6 +179,14 @@ async def test_ledger_service_run_produces_matched_report_for_single_asset(
     assert len(report.balance_checks) == 1
 
 
+def fake_batch_response(kind: str, requests: list[Any]) -> list[Any]:
+    if kind == "receipt":
+        return [{"logs": []} for _ in requests]
+    if requests[0][0] == "eth_call":
+        return ["0x" + format(0, "064x") for _ in requests]
+    return [{"timestamp": hex(1_700_000_000)} for _ in requests]
+
+
 class FakeCtfClient:
     def __init__(self, wallet: str, single_incoming_logs: list[dict[str, Any]]) -> None:
         self._wallet = wallet
@@ -198,9 +207,7 @@ class FakeCtfClient:
 
     async def batch_call(self, kind: str, requests: list[Any]) -> list[Any]:
         self.batch_calls.append((kind, requests))
-        if kind == "receipt":
-            return [{"logs": []} for _ in requests]
-        return [{"timestamp": hex(1_700_000_000)} for _ in requests]
+        return fake_batch_response(kind, requests)
 
 
 async def test_ledger_service_process_ctf_batches_receipts_and_timestamps_across_positions(
@@ -246,12 +253,12 @@ async def test_ledger_service_process_ctf_batches_receipts_and_timestamps_across
     assert len(report.balance_checks) == 2
     assert len(repository.events) == 2
 
-    receipt_calls = [requests for kind, requests in client.batch_calls if kind == "receipt"]
-    timestamp_calls = [requests for kind, requests in client.batch_calls if kind != "receipt"]
-    assert len(receipt_calls) == 1
-    assert len(receipt_calls[0]) == 2
-    assert len(timestamp_calls) == 1
-    assert len(timestamp_calls[0]) == 2
+    calls_by_method: dict[str, list[list[Any]]] = {}
+    for _kind, requests in client.batch_calls:
+        calls_by_method.setdefault(requests[0][0], []).append(requests)
+    assert [len(requests) for requests in calls_by_method["eth_getTransactionReceipt"]] == [2]
+    assert [len(requests) for requests in calls_by_method["eth_getBlockByNumber"]] == [2]
+    assert [len(requests) for requests in calls_by_method["eth_call"]] == [2]
 
 
 class FakeCtfResumeClient:
@@ -277,12 +284,10 @@ class FakeCtfResumeClient:
         raise AssertionError(method)
 
     async def batch_call(self, kind: str, requests: list[Any]) -> list[Any]:
-        if kind == "receipt":
-            return [{"logs": []} for _ in requests]
-        return [{"timestamp": hex(1_700_000_000)} for _ in requests]
+        return fake_batch_response(kind, requests)
 
 
-async def test_ledger_service_second_run_still_reconciles_ctf_positions_from_first_run(
+async def test_ledger_service_reconciles_ctf_positions_from_previous_runs(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from app.rpc import contracts
@@ -353,9 +358,9 @@ async def test_ledger_service_run_scans_and_reconciles_at_confirmation_lagged_bl
 
 class PersistConcurrencySettings(FakeSettings):
     free_log_rpc_window_blocks = 1
-    goldsky_raw_log_rpc_concurrency_min = 20
-    goldsky_raw_log_rpc_concurrency_start = 20
-    goldsky_raw_log_rpc_concurrency_max = 20
+    log_rpc_concurrency_min = 20
+    log_rpc_concurrency_start = 20
+    log_rpc_concurrency_max = 20
     persist_concurrency = 3
 
 
@@ -403,7 +408,7 @@ class ConcurrencyTrackingClient:
         return [{"timestamp": hex(1_700_000_000)} for _ in requests]
 
 
-async def test_ledger_service_bounds_concurrent_persist_work_below_log_fetch_concurrency(
+async def test_ledger_service_limits_persist_concurrency(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from app.rpc import contracts
@@ -431,9 +436,5 @@ async def test_ledger_service_bounds_concurrent_persist_work_below_log_fetch_con
     service = LedgerService(client, repository, PersistConcurrencySettings())
     await service.run(wallet)
 
-    # 15 single-block chunks all become fetchable at once under a concurrency-20 limiter, so an
-    # unguarded pipeline would run close to 15 persist_batch calls (each fetching receipts and
-    # timestamps) concurrently. The dedicated persist_semaphore must cap that at persist_concurrency
-    # regardless of how many raw-log fetches the limiter allows through simultaneously.
     assert client.max_concurrent_persist_calls == PersistConcurrencySettings.persist_concurrency
     assert len(repository.events) == chunk_count

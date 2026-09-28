@@ -1,7 +1,7 @@
 from typing import Any
 
 from app.ledger.models import Asset
-from app.ledger.reconciliation import fetch_onchain_balance, reconcile_asset
+from app.ledger.reconciliation import fetch_onchain_balance, reconcile_asset, reconcile_assets
 from app.rpc.client import RpcKind
 
 WALLET = "0x46b353667fd7d846af3bbeda6584b0e5b883d3de"
@@ -58,3 +58,46 @@ async def test_reconcile_asset_matched_false_when_different() -> None:
     )
     result = await reconcile_asset(client, WALLET, asset, computed_balance=400, block_number=100)
     assert result.matched is False
+
+
+class FakeBatchClient:
+    def __init__(self, balance_by_position: dict[int, int]) -> None:
+        self._balance_by_position = balance_by_position
+        self.batch_sizes: list[int] = []
+
+    async def batch_call(self, kind: RpcKind, requests: list[tuple[str, list[Any]]]) -> list[str]:
+        assert kind == "call"
+        self.batch_sizes.append(len(requests))
+        balances = []
+        for method, params in requests:
+            assert method == "eth_call"
+            position_id = int(params[0]["data"][-64:], 16)
+            balances.append("0x" + format(self._balance_by_position[position_id], "064x"))
+        return balances
+
+
+async def test_reconcile_assets_splits_positions_into_rpc_batches() -> None:
+    client = FakeBatchClient({position_id: position_id * 10 for position_id in range(1, 6)})
+    computed_by_asset = [
+        (
+            Asset(
+                kind="erc1155",
+                contract_address="0xctf",
+                position_id=position_id,
+                symbol=None,
+                decimals=0,
+            ),
+            position_id * 10,
+        )
+        for position_id in range(1, 6)
+    ]
+    computed_by_asset[4] = (computed_by_asset[4][0], 0)
+
+    results = await reconcile_assets(
+        client, WALLET, computed_by_asset, block_number=100, batch_size=2
+    )
+
+    assert client.batch_sizes == [2, 2, 1]
+    assert [result.onchain_balance for result in results] == [10, 20, 30, 40, 50]
+    assert [result.matched for result in results] == [True, True, True, True, False]
+    assert {result.checked_at_block for result in results} == {100}

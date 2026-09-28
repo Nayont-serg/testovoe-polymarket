@@ -87,6 +87,24 @@ async def test_acquire_blocks_at_limit_and_release_frees_slot() -> None:
     assert acquired_second is True
 
 
+async def test_acquire_waiter_proceeds_when_degrade_expires_without_release() -> None:
+    fake_time = {"now": 0.0}
+    limiter = AdaptiveConcurrencyLimiter(
+        min_limit=1,
+        start_limit=2,
+        max_limit=2,
+        grow_interval_seconds=180,
+        clock=lambda: fake_time["now"],
+    )
+    limiter.degrade(30)
+    await limiter.acquire()
+    waiter = asyncio.ensure_future(limiter.acquire())
+    await asyncio.sleep(0.05)
+    assert waiter.done() is False
+    fake_time["now"] = 31
+    await asyncio.wait_for(waiter, timeout=3)
+
+
 class BisectingFakeClient:
     def __init__(self, threshold: int, found_log: dict[str, Any], found_block: int) -> None:
         self._threshold = threshold
@@ -146,7 +164,7 @@ class TaskCountingFakeClient:
         )
 
 
-async def test_fetch_wallet_logs_bounds_live_task_count_during_deep_bisection() -> None:
+async def test_fetch_wallet_logs_bounds_task_count_on_bisection() -> None:
     client = TaskCountingFakeClient()
     worker_count = 4
     limiter = AdaptiveConcurrencyLimiter(worker_count, worker_count, worker_count, 180)
@@ -389,9 +407,7 @@ async def test_discover_ctf_transfers_merges_out_and_in_and_explodes_pairs() -> 
         assert batch_out.log_index == 1
 
 
-async def test_discover_ctf_transfers_coalesces_duplicate_position_id_within_one_batch_log() -> (
-    None
-):
+async def test_discover_ctf_transfers_coalesces_duplicate_position_ids() -> None:
     wallet = "0x46b353667fd7d846af3bbeda6584b0e5b883d3de"
     counterparty = "0x9999999999999999999999999999999999999999"
     operator = "0x8888888888888888888888888888888888888888"
@@ -458,9 +474,7 @@ class ManyChunksFakeClient:
         ]
 
 
-async def test_discover_erc20_transfers_streams_batches_instead_of_accumulating_everything() -> (
-    None
-):
+async def test_discover_erc20_transfers_streams_batches_to_sink() -> None:
     wallet = "0x46b353667fd7d846af3bbeda6584b0e5b883d3de"
     counterparty = "0x9999999999999999999999999999999999999999"
     logs_per_chunk = 10
