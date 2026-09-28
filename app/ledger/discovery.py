@@ -145,15 +145,19 @@ async def _fetch_wallet_logs(
                 return
             await limiter.acquire()
             try:
-                logs = await _fetch_chunk(client, contract_address, topics, chunk_start, chunk_end)
-                if logs:
-                    await sink(logs)
-            except LogQueryTooLargeError:
-                if chunk_start == chunk_end:
-                    raise
-                mid = (chunk_start + chunk_end) // 2
-                queue.put_nowait((chunk_start, mid))
-                queue.put_nowait((mid + 1, chunk_end))
+                try:
+                    logs = await _fetch_chunk(
+                        client, contract_address, topics, chunk_start, chunk_end
+                    )
+                except LogQueryTooLargeError:
+                    if chunk_start == chunk_end:
+                        raise
+                    mid = (chunk_start + chunk_end) // 2
+                    queue.put_nowait((chunk_start, mid))
+                    queue.put_nowait((mid + 1, chunk_end))
+                else:
+                    if logs:
+                        await sink(logs)
             finally:
                 await limiter.release()
 
@@ -199,7 +203,7 @@ async def discover_erc20_transfers(
         if fresh:
             await sink(fresh)
 
-    await asyncio.gather(
+    results = await asyncio.gather(
         _fetch_wallet_logs(
             client,
             limiter,
@@ -220,7 +224,11 @@ async def discover_erc20_transfers(
             window,
             handle_logs,
         ),
+        return_exceptions=True,
     )
+    for result in results:
+        if isinstance(result, BaseException):
+            raise result
 
 
 async def discover_ctf_transfers(
@@ -283,7 +291,7 @@ async def discover_ctf_transfers(
         if fresh:
             await sink(fresh)
 
-    await asyncio.gather(
+    results = await asyncio.gather(
         _fetch_wallet_logs(
             client,
             limiter,
@@ -324,4 +332,8 @@ async def discover_ctf_transfers(
             window,
             handle_batch,
         ),
+        return_exceptions=True,
     )
+    for result in results:
+        if isinstance(result, BaseException):
+            raise result
