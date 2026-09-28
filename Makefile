@@ -1,7 +1,7 @@
 .PHONY: run test test-integration lint migrate docker-up docker-down
 
 run:
-	uv run python -m app.main
+	uv run --env-file .env python -m app.main
 
 test:
 	uv run pytest tests/unit
@@ -14,7 +14,7 @@ lint:
 	uv run ruff format --check .
 
 migrate:
-	uv run python -m app.db.migrate
+	uv run --env-file .env python -m app.db.migrate
 
 docker-up:
 	docker compose up -d --wait
