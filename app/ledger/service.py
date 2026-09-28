@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
 
 from app.config import Settings
@@ -15,7 +16,6 @@ from app.ledger.reconciliation import reconcile_asset
 from app.rpc import contracts
 from app.rpc.client import JsonRpcClient
 
-# Stays clear of blocks that could still be orphaned by a short Polygon reorg.
 CONFIRMATION_LAG_BLOCKS = 20
 
 
@@ -50,6 +50,12 @@ class LedgerService:
         self._client.on_rate_limited = lambda: limiter.degrade(
             self._client.rate_limit_cooldown_seconds
         )
+        # Caps concurrent receipt/timestamp/DB work separately from limiter's raw-log-fetch
+        # concurrency: a dense on-chain range can keep limiter.max_limit chunk fetches
+        # concurrently alive, and each chunk's persist step can itself hold many full tx
+        # receipts, so gating persist by the same (much larger) limiter let peak memory scale
+        # with max_limit instead of with a small, fixed number of in-flight persists.
+        persist_semaphore = asyncio.Semaphore(self._settings.persist_concurrency)
 
         checks: list[BalanceCheckResult] = []
         for asset in contracts.COLLATERAL_ASSETS:
@@ -58,6 +64,7 @@ class LedgerService:
                     asset,
                     wallet_address,
                     limiter,
+                    persist_semaphore,
                     latest_block,
                     default_start_block=contracts.COLLATERAL_DEPLOY_BLOCKS.get(
                         asset.contract_address, contracts.CTF_DEPLOY_BLOCK
@@ -65,7 +72,9 @@ class LedgerService:
                 )
             )
 
-        for asset in await self._process_ctf(wallet_address, limiter, latest_block):
+        for asset in await self._process_ctf(
+            wallet_address, limiter, persist_semaphore, latest_block
+        ):
             checks.append(await self._reconcile(asset, wallet_address, latest_block))
 
         return LedgerReport(balance_checks=checks)
@@ -75,6 +84,7 @@ class LedgerService:
         asset: Asset,
         wallet_address: str,
         limiter: AdaptiveConcurrencyLimiter,
+        persist_semaphore: asyncio.Semaphore,
         latest_block: int,
         default_start_block: int,
     ) -> BalanceCheckResult:
@@ -83,7 +93,8 @@ class LedgerService:
         scan_start = checkpoint + 1 if checkpoint is not None else default_start_block
 
         async def persist_batch(batch: list[RawTransfer]) -> None:
-            await self._persist_transfers(asset, asset_id, wallet_address, batch)
+            async with persist_semaphore:
+                await self._persist_transfers(asset, asset_id, wallet_address, batch)
 
         await discover_erc20_transfers(
             self._client,
@@ -99,7 +110,11 @@ class LedgerService:
         return await self._reconcile(asset, wallet_address, latest_block)
 
     async def _process_ctf(
-        self, wallet_address: str, limiter: AdaptiveConcurrencyLimiter, latest_block: int
+        self,
+        wallet_address: str,
+        limiter: AdaptiveConcurrencyLimiter,
+        persist_semaphore: asyncio.Semaphore,
+        latest_block: int,
     ) -> list[Asset]:
         checkpoint_asset = Asset(
             kind="erc1155",
@@ -116,42 +131,44 @@ class LedgerService:
         asset_ids_by_position: dict[int, int] = {}
 
         async def persist_batch(batch: list[RawTransfer]) -> None:
-            for transfer in batch:
-                if transfer.position_id not in asset_ids_by_position:
-                    asset = Asset(
-                        kind="erc1155",
-                        contract_address=contracts.CTF_ADDRESS,
-                        position_id=transfer.position_id,
-                        symbol=None,
-                        decimals=0,
-                    )
-                    # Concurrent batches may race here; ensure_asset's ON CONFLICT makes it benign.
-                    asset_id = await self._repository.ensure_asset(asset)
-                    assets_by_position[transfer.position_id] = asset
-                    asset_ids_by_position[transfer.position_id] = asset_id
+            async with persist_semaphore:
+                for transfer in batch:
+                    if transfer.position_id not in asset_ids_by_position:
+                        asset = Asset(
+                            kind="erc1155",
+                            contract_address=contracts.CTF_ADDRESS,
+                            position_id=transfer.position_id,
+                            symbol=None,
+                            decimals=0,
+                        )
+                        # Concurrent batches may race here; ensure_asset's ON CONFLICT makes it
+                        # benign.
+                        asset_id = await self._repository.ensure_asset(asset)
+                        assets_by_position[transfer.position_id] = asset
+                        asset_ids_by_position[transfer.position_id] = asset_id
 
-            tx_hashes = list({t.tx_hash for t in batch})
-            receipts = await fetch_receipts(
-                self._client, tx_hashes, self._settings.w3_free_receipt_rpc_batch_size
-            )
-            block_numbers = list({t.block_number for t in batch})
-            timestamps = await fetch_block_timestamps(
-                self._client, block_numbers, self._settings.w3_block_timestamps_rpc_batch_size
-            )
-            entries_by_asset_id: dict[int, list[LedgerEntry]] = {}
-            for transfer in batch:
-                asset = assets_by_position[transfer.position_id]
-                asset_id = asset_ids_by_position[transfer.position_id]
-                entry = build_ledger_entry(
-                    transfer,
-                    asset,
-                    wallet_address,
-                    receipts[transfer.tx_hash],
-                    timestamps[transfer.block_number],
+                tx_hashes = list({t.tx_hash for t in batch})
+                receipts = await fetch_receipts(
+                    self._client, tx_hashes, self._settings.w3_free_receipt_rpc_batch_size
                 )
-                entries_by_asset_id.setdefault(asset_id, []).append(entry)
-            for asset_id, entries in entries_by_asset_id.items():
-                await self._repository.upsert_events(asset_id, entries)
+                block_numbers = list({t.block_number for t in batch})
+                timestamps = await fetch_block_timestamps(
+                    self._client, block_numbers, self._settings.w3_block_timestamps_rpc_batch_size
+                )
+                entries_by_asset_id: dict[int, list[LedgerEntry]] = {}
+                for transfer in batch:
+                    asset = assets_by_position[transfer.position_id]
+                    asset_id = asset_ids_by_position[transfer.position_id]
+                    entry = build_ledger_entry(
+                        transfer,
+                        asset,
+                        wallet_address,
+                        receipts[transfer.tx_hash],
+                        timestamps[transfer.block_number],
+                    )
+                    entries_by_asset_id.setdefault(asset_id, []).append(entry)
+                for asset_id, entries in entries_by_asset_id.items():
+                    await self._repository.upsert_events(asset_id, entries)
 
         await discover_ctf_transfers(
             self._client,

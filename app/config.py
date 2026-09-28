@@ -25,6 +25,7 @@ class Settings:
     w3_free_receipt_rpc_batch_size: int
     w3_block_timestamps_loading_batch_size: int
     w3_block_timestamps_rpc_batch_size: int
+    persist_concurrency: int
 
     @classmethod
     def from_env(cls, env: dict[str, str] | None = None) -> Settings:
@@ -69,4 +70,5 @@ class Settings:
             w3_block_timestamps_rpc_batch_size=int(
                 source.get("W3_BLOCK_TIMESTAMPS_RPC_BATCH_SIZE", "2000")
             ),
+            persist_concurrency=int(source.get("PERSIST_CONCURRENCY", "4")),
         )

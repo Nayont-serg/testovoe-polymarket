@@ -1,10 +1,11 @@
+import asyncio
 from typing import Any
 
 import pytest
 
 from app.ledger.models import Asset, BalanceCheckResult, LedgerEntry
 from app.ledger.service import CONFIRMATION_LAG_BLOCKS, LedgerReport, LedgerService
-from app.rpc.codec import TRANSFER_SINGLE_TOPIC, address_topic
+from app.rpc.codec import TRANSFER_SINGLE_TOPIC, TRANSFER_TOPIC, address_topic
 
 
 def test_ledger_report_all_matched_true_when_every_check_matches() -> None:
@@ -61,6 +62,7 @@ class FakeSettings:
     goldsky_raw_log_rpc_concurrency_grow_interval_sec = 180
     w3_free_receipt_rpc_batch_size = 500
     w3_block_timestamps_rpc_batch_size = 2000
+    persist_concurrency = 4
 
 
 class FakeClient:
@@ -347,3 +349,91 @@ async def test_ledger_service_run_scans_and_reconciles_at_confirmation_lagged_bl
     expected_block = raw_latest_block - CONFIRMATION_LAG_BLOCKS
     assert report.balance_checks[0].checked_at_block == expected_block
     assert set(repository.checkpoints.values()) == {expected_block}
+
+
+class PersistConcurrencySettings(FakeSettings):
+    free_log_rpc_window_blocks = 1
+    goldsky_raw_log_rpc_concurrency_min = 20
+    goldsky_raw_log_rpc_concurrency_start = 20
+    goldsky_raw_log_rpc_concurrency_max = 20
+    persist_concurrency = 3
+
+
+class ConcurrencyTrackingClient:
+    def __init__(
+        self, wallet: str, counterparty: str, chunk_count: int, persist_delay: float
+    ) -> None:
+        self._wallet_topic = address_topic(wallet)
+        self._counterparty_topic = address_topic(counterparty)
+        self._chunk_count = chunk_count
+        self._persist_delay = persist_delay
+        self._active_persist_calls = 0
+        self.max_concurrent_persist_calls = 0
+
+    async def call(self, _kind: str, method: str, params: list[Any]) -> Any:
+        if method == "eth_blockNumber":
+            return hex(self._chunk_count - 1 + CONFIRMATION_LAG_BLOCKS)
+        if method == "eth_getLogs":
+            topics = params[0]["topics"]
+            if topics[0] != TRANSFER_TOPIC or topics[2] != self._wallet_topic:
+                return []
+            from_block = int(params[0]["fromBlock"], 16)
+            return [
+                {
+                    "topics": [TRANSFER_TOPIC, self._counterparty_topic, self._wallet_topic],
+                    "data": "0x" + format(1, "064x"),
+                    "blockNumber": hex(from_block),
+                    "transactionHash": f"0x{from_block}",
+                    "logIndex": "0x0",
+                }
+            ]
+        if method == "eth_call":
+            return "0x" + format(0, "064x")
+        raise AssertionError(method)
+
+    async def batch_call(self, kind: str, requests: list[Any]) -> list[Any]:
+        self._active_persist_calls += 1
+        self.max_concurrent_persist_calls = max(
+            self.max_concurrent_persist_calls, self._active_persist_calls
+        )
+        await asyncio.sleep(self._persist_delay)
+        self._active_persist_calls -= 1
+        if kind == "receipt":
+            return [{"logs": []} for _ in requests]
+        return [{"timestamp": hex(1_700_000_000)} for _ in requests]
+
+
+async def test_ledger_service_bounds_concurrent_persist_work_below_log_fetch_concurrency(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app.rpc import contracts
+
+    wallet = "0x46b353667fd7d846af3bbeda6584b0e5b883d3de"
+    counterparty = "0x9999999999999999999999999999999999999999"
+    monkeypatch.setattr(
+        contracts,
+        "COLLATERAL_ASSETS",
+        (
+            Asset(
+                kind="erc20",
+                contract_address="0xusdc",
+                position_id=None,
+                symbol="USDC",
+                decimals=6,
+            ),
+        ),
+    )
+    monkeypatch.setattr(contracts, "COLLATERAL_DEPLOY_BLOCKS", {"0xusdc": 0})
+
+    chunk_count = 15
+    client = ConcurrencyTrackingClient(wallet, counterparty, chunk_count, persist_delay=0.02)
+    repository = FakeRepository()
+    service = LedgerService(client, repository, PersistConcurrencySettings())
+    await service.run(wallet)
+
+    # 15 single-block chunks all become fetchable at once under a concurrency-20 limiter, so an
+    # unguarded pipeline would run close to 15 persist_batch calls (each fetching receipts and
+    # timestamps) concurrently. The dedicated persist_semaphore must cap that at persist_concurrency
+    # regardless of how many raw-log fetches the limiter allows through simultaneously.
+    assert client.max_concurrent_persist_calls == PersistConcurrencySettings.persist_concurrency
+    assert len(repository.events) == chunk_count
