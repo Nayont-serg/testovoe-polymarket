@@ -1,4 +1,5 @@
 import asyncio
+from collections.abc import Awaitable, Callable
 from typing import Any
 
 import pytest
@@ -8,6 +9,7 @@ from app.ledger.discovery import (
     AdaptiveConcurrencyLimiter,
     _fetch_chunk,
     _fetch_wallet_logs,
+    _fetch_wallet_logs_multi,
     block_chunks,
     discover_ctf_transfers,
     discover_erc20_transfers,
@@ -235,6 +237,11 @@ class FakeClient:
         topics = params[0]["topics"]
         direction = 1 if topics[1] is not None else 2
         return self._logs_by_direction.get(direction, [])
+
+    async def batch_call(
+        self, kind: str, requests: list[tuple[str, list[Any]]]
+    ) -> list[list[dict[str, Any]]]:
+        return [await self.call(kind, method, params) for method, params in requests]
 
 
 async def test_discover_erc20_transfers_merges_in_and_out_and_decodes() -> None:
@@ -473,6 +480,11 @@ class ManyChunksFakeClient:
             for i in range(self._logs_per_chunk)
         ]
 
+    async def batch_call(
+        self, kind: str, requests: list[tuple[str, list[Any]]]
+    ) -> list[list[dict[str, Any]]]:
+        return [await self.call(kind, method, params) for method, params in requests]
+
 
 async def test_discover_erc20_transfers_streams_batches_to_sink() -> None:
     wallet = "0x46b353667fd7d846af3bbeda6584b0e5b883d3de"
@@ -508,3 +520,153 @@ async def test_discover_erc20_transfers_streams_batches_to_sink() -> None:
     assert len(batch_sizes) > 1
     assert max(batch_sizes) <= logs_per_chunk
     assert max(batch_sizes) < expected_total
+
+
+def _make_async_collector() -> tuple[
+    list[dict[str, Any]], Callable[[list[dict[str, Any]]], Awaitable[None]]
+]:
+    collected: list[dict[str, Any]] = []
+
+    async def sink(logs: list[dict[str, Any]]) -> None:
+        collected.extend(logs)
+
+    return collected, sink
+
+
+class CountingBatchOnlyClient:
+    def __init__(self, log_a: dict[str, Any], log_b: dict[str, Any]) -> None:
+        self._log_a = log_a
+        self._log_b = log_b
+        self.call_count = 0
+        self.batch_call_count = 0
+
+    async def call(
+        self, _kind: str, _method: str, _params: list[dict[str, Any]]
+    ) -> list[dict[str, Any]]:
+        self.call_count += 1
+        raise AssertionError("call() should not be used when batch_call succeeds")
+
+    async def batch_call(
+        self, _kind: str, requests: list[tuple[str, list[Any]]]
+    ) -> list[list[dict[str, Any]]]:
+        self.batch_call_count += 1
+        assert len(requests) == 2
+        return [[self._log_a], [self._log_b]]
+
+
+async def test_fetch_wallet_logs_multi_issues_one_batch_call_per_chunk() -> None:
+    log_a = {"blockNumber": hex(5), "transactionHash": "0xa", "logIndex": "0x0"}
+    log_b = {"blockNumber": hex(5), "transactionHash": "0xb", "logIndex": "0x0"}
+    client = CountingBatchOnlyClient(log_a, log_b)
+    limiter = AdaptiveConcurrencyLimiter(2, 60, 100, 180)
+    collected_a, sink_a = _make_async_collector()
+    collected_b, sink_b = _make_async_collector()
+
+    await _fetch_wallet_logs_multi(
+        client,
+        limiter,
+        "0xusdc",
+        [[TRANSFER_TOPIC, "0xwallet", None], [TRANSFER_TOPIC, None, "0xwallet"]],
+        start_block=0,
+        end_block=9,
+        window=10,
+        sinks=[sink_a, sink_b],
+    )
+
+    assert client.batch_call_count == 1
+    assert client.call_count == 0
+    assert collected_a == [log_a]
+    assert collected_b == [log_b]
+
+
+class FailingBatchThenIndividualClient:
+    def __init__(self, log_a: dict[str, Any], log_b: dict[str, Any]) -> None:
+        self._log_a = log_a
+        self._log_b = log_b
+        self.call_count = 0
+        self.batch_call_count = 0
+
+    async def batch_call(
+        self, _kind: str, _requests: list[tuple[str, list[Any]]]
+    ) -> list[list[dict[str, Any]]]:
+        self.batch_call_count += 1
+        raise RpcAllEndpointsExhaustedError("log", "eth_getLogs")
+
+    async def call(
+        self, _kind: str, _method: str, params: list[dict[str, Any]]
+    ) -> list[dict[str, Any]]:
+        self.call_count += 1
+        topics = params[0]["topics"]
+        return [self._log_a] if topics[1] is not None else [self._log_b]
+
+
+async def test_fetch_wallet_logs_multi_falls_back_to_individual_calls_when_batch_fails() -> None:
+    log_a = {"blockNumber": hex(5), "transactionHash": "0xa", "logIndex": "0x0"}
+    log_b = {"blockNumber": hex(5), "transactionHash": "0xb", "logIndex": "0x0"}
+    client = FailingBatchThenIndividualClient(log_a, log_b)
+    limiter = AdaptiveConcurrencyLimiter(2, 60, 100, 180)
+    collected_a, sink_a = _make_async_collector()
+    collected_b, sink_b = _make_async_collector()
+
+    await _fetch_wallet_logs_multi(
+        client,
+        limiter,
+        "0xusdc",
+        [[TRANSFER_TOPIC, "0xwallet", None], [TRANSFER_TOPIC, None, "0xwallet"]],
+        start_block=0,
+        end_block=9,
+        window=10,
+        sinks=[sink_a, sink_b],
+    )
+
+    assert client.batch_call_count == 1
+    assert client.call_count == 2
+    assert collected_a == [log_a]
+    assert collected_b == [log_b]
+
+
+class BatchFailsThenBisectsClient:
+    def __init__(self, threshold: int, found_log: dict[str, Any], found_block: int) -> None:
+        self._threshold = threshold
+        self._found_log = found_log
+        self._found_block = found_block
+
+    async def batch_call(
+        self, _kind: str, _requests: list[tuple[str, list[Any]]]
+    ) -> list[list[dict[str, Any]]]:
+        raise RpcAllEndpointsExhaustedError("log", "eth_getLogs")
+
+    async def call(
+        self, _kind: str, _method: str, params: list[dict[str, Any]]
+    ) -> list[dict[str, Any]]:
+        from_block = int(params[0]["fromBlock"], 16)
+        to_block = int(params[0]["toBlock"], 16)
+        if to_block - from_block > self._threshold:
+            raise LogQueryTooLargeError(
+                "Query returned more than 20000 results. Try with this block range [0x0, 0x1]"
+            )
+        if from_block <= self._found_block <= to_block:
+            return [self._found_log]
+        return []
+
+
+async def test_fetch_wallet_logs_multi_bisects_via_fallback_when_batch_fails() -> None:
+    found_log = {"blockNumber": hex(750), "transactionHash": "0xfound", "logIndex": "0x0"}
+    client = BatchFailsThenBisectsClient(threshold=10, found_log=found_log, found_block=750)
+    limiter = AdaptiveConcurrencyLimiter(2, 60, 100, 180)
+    collected_a, sink_a = _make_async_collector()
+    collected_b, sink_b = _make_async_collector()
+
+    await _fetch_wallet_logs_multi(
+        client,
+        limiter,
+        "0xusdc",
+        [[TRANSFER_TOPIC, "0xwallet", None], [TRANSFER_TOPIC, None, "0xwallet"]],
+        start_block=0,
+        end_block=999,
+        window=1000,
+        sinks=[sink_a, sink_b],
+    )
+
+    assert collected_a == [found_log]
+    assert collected_b == [found_log]

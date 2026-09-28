@@ -96,6 +96,8 @@ class FakeClient:
     async def batch_call(self, kind: str, requests: list[Any]) -> list[Any]:
         if kind == "receipt":
             return [{"logs": []} for _ in requests]
+        if requests and requests[0][0] == "eth_getLogs":
+            return [await self.call(kind, method, params) for method, params in requests]
         return [{"timestamp": hex(1_700_000_000)} for _ in requests]
 
 
@@ -397,6 +399,8 @@ class ConcurrencyTrackingClient:
         raise AssertionError(method)
 
     async def batch_call(self, kind: str, requests: list[Any]) -> list[Any]:
+        if requests and requests[0][0] == "eth_getLogs":
+            return [await self.call(kind, method, params) for method, params in requests]
         self._active_persist_calls += 1
         self.max_concurrent_persist_calls = max(
             self.max_concurrent_persist_calls, self._active_persist_calls

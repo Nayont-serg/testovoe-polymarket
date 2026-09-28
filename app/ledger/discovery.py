@@ -167,6 +167,101 @@ async def _fetch_wallet_logs(
             raise error
 
 
+async def _fetch_chunk_batch(
+    client: JsonRpcClient,
+    contract_address: str,
+    topic_variants: list[list[str | None]],
+    chunk_start: int,
+    chunk_end: int,
+) -> list[list[RpcLog]] | None:
+    requests = [
+        (
+            "eth_getLogs",
+            [
+                {
+                    "address": contract_address,
+                    "topics": topics,
+                    "fromBlock": hex(chunk_start),
+                    "toBlock": hex(chunk_end),
+                }
+            ],
+        )
+        for topics in topic_variants
+    ]
+    try:
+        return await client.batch_call("log", requests)
+    except RpcAllEndpointsExhaustedError:
+        return None
+
+
+async def _fetch_wallet_logs_multi(
+    client: JsonRpcClient,
+    limiter: AdaptiveConcurrencyLimiter,
+    contract_address: str,
+    topic_variants: list[list[str | None]],
+    start_block: int,
+    end_block: int,
+    window: int,
+    sinks: list[Callable[[list[RpcLog]], Awaitable[None]]],
+) -> None:
+    # The third element is the variant to (re)fetch on its own, or None to try every
+    # variant together as one batch first — a bisected sub-range must stay scoped to the
+    # single variant that overflowed, or it would silently re-run the variants that
+    # already succeeded on the pre-bisection range.
+    queue: asyncio.Queue[tuple[int, int, int | None]] = asyncio.Queue()
+    for chunk_start, chunk_end in block_chunks(start_block, end_block, window):
+        queue.put_nowait((chunk_start, chunk_end, None))
+
+    async def fetch_variant_with_bisection(
+        variant_index: int, chunk_start: int, chunk_end: int
+    ) -> None:
+        try:
+            logs = await _fetch_chunk(
+                client, contract_address, topic_variants[variant_index], chunk_start, chunk_end
+            )
+        except LogQueryTooLargeError:
+            if chunk_start == chunk_end:
+                raise
+            mid = (chunk_start + chunk_end) // 2
+            queue.put_nowait((chunk_start, mid, variant_index))
+            queue.put_nowait((mid + 1, chunk_end, variant_index))
+        else:
+            if logs:
+                await sinks[variant_index](logs)
+
+    async def worker() -> None:
+        while True:
+            try:
+                chunk_start, chunk_end, variant_index = queue.get_nowait()
+            except asyncio.QueueEmpty:
+                return
+            await limiter.acquire()
+            try:
+                if variant_index is not None:
+                    await fetch_variant_with_bisection(variant_index, chunk_start, chunk_end)
+                    continue
+                # One batched HTTP request per chunk instead of one per topic variant,
+                # to reduce request-rate pressure on rate-limited free RPC endpoints.
+                batched = await _fetch_chunk_batch(
+                    client, contract_address, topic_variants, chunk_start, chunk_end
+                )
+                if batched is not None:
+                    for index, logs in enumerate(batched):
+                        if logs:
+                            await sinks[index](logs)
+                else:
+                    for index in range(len(topic_variants)):
+                        await fetch_variant_with_bisection(index, chunk_start, chunk_end)
+            finally:
+                await limiter.release()
+
+    workers = [asyncio.create_task(worker()) for _ in range(limiter.max_limit)]
+    errors = await asyncio.gather(*workers, return_exceptions=True)
+    for error in errors:
+        if isinstance(error, BaseException):
+            raise error
+
+
 async def discover_erc20_transfers(
     client: JsonRpcClient,
     limiter: AdaptiveConcurrencyLimiter,
@@ -202,32 +297,19 @@ async def discover_erc20_transfers(
         if fresh:
             await sink(fresh)
 
-    results = await asyncio.gather(
-        _fetch_wallet_logs(
-            client,
-            limiter,
-            asset.contract_address,
+    await _fetch_wallet_logs_multi(
+        client,
+        limiter,
+        asset.contract_address,
+        [
             [TRANSFER_TOPIC, wallet_topic, None],
-            start_block,
-            end_block,
-            window,
-            handle_logs,
-        ),
-        _fetch_wallet_logs(
-            client,
-            limiter,
-            asset.contract_address,
             [TRANSFER_TOPIC, None, wallet_topic],
-            start_block,
-            end_block,
-            window,
-            handle_logs,
-        ),
-        return_exceptions=True,
+        ],
+        start_block,
+        end_block,
+        window,
+        [handle_logs, handle_logs],
     )
-    for result in results:
-        if isinstance(result, BaseException):
-            raise result
 
 
 async def discover_ctf_transfers(
