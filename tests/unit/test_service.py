@@ -3,7 +3,7 @@ from typing import Any
 import pytest
 
 from app.ledger.models import Asset, BalanceCheckResult, LedgerEntry
-from app.ledger.service import LedgerReport, LedgerService
+from app.ledger.service import CONFIRMATION_LAG_BLOCKS, LedgerReport, LedgerService
 from app.rpc.codec import TRANSFER_SINGLE_TOPIC, address_topic
 
 
@@ -80,7 +80,7 @@ class FakeClient:
         from app.rpc.codec import TRANSFER_TOPIC
 
         if method == "eth_blockNumber":
-            return hex(10)
+            return hex(10 + CONFIRMATION_LAG_BLOCKS)
         if method == "eth_getLogs":
             topics = params[0]["topics"]
             if topics[0] != TRANSFER_TOPIC:
@@ -184,7 +184,7 @@ class FakeCtfClient:
 
     async def call(self, _kind: str, method: str, params: list[Any]) -> Any:
         if method == "eth_blockNumber":
-            return hex(10)
+            return hex(10 + CONFIRMATION_LAG_BLOCKS)
         if method == "eth_getLogs":
             topics = params[0]["topics"]
             if topics[0] == TRANSFER_SINGLE_TOPIC and topics[3] is not None:
@@ -255,7 +255,7 @@ async def test_ledger_service_process_ctf_batches_receipts_and_timestamps_across
 class FakeCtfResumeClient:
     def __init__(self, single_incoming_log: dict[str, Any]) -> None:
         self._single_incoming_log = single_incoming_log
-        self.latest_block = 10
+        self.latest_block = 10 + CONFIRMATION_LAG_BLOCKS
         self.discover_new_logs = True
 
     async def call(self, _kind: str, method: str, params: list[Any]) -> Any:
@@ -309,8 +309,41 @@ async def test_ledger_service_second_run_still_reconciles_ctf_positions_from_fir
     first_report = await service.run(wallet)
     assert len(first_report.balance_checks) == 1
 
-    client.latest_block = 20
+    client.latest_block = 20 + CONFIRMATION_LAG_BLOCKS
     client.discover_new_logs = False
     second_report = await service.run(wallet)
 
     assert len(second_report.balance_checks) == 1
+
+
+async def test_ledger_service_run_scans_and_reconciles_at_confirmation_lagged_block(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app.rpc import contracts
+
+    wallet = "0x46b353667fd7d846af3bbeda6584b0e5b883d3de"
+    counterparty = "0x9999999999999999999999999999999999999999"
+    monkeypatch.setattr(
+        contracts,
+        "COLLATERAL_ASSETS",
+        (
+            Asset(
+                kind="erc20",
+                contract_address="0xusdc",
+                position_id=None,
+                symbol="USDC",
+                decimals=6,
+            ),
+        ),
+    )
+    monkeypatch.setattr(contracts, "COLLATERAL_DEPLOY_BLOCKS", {"0xusdc": 0})
+
+    raw_latest_block = 10 + CONFIRMATION_LAG_BLOCKS
+    client = FakeClient(wallet, counterparty)
+    repository = FakeRepository()
+    service = LedgerService(client, repository, FakeSettings())
+    report = await service.run(wallet)
+
+    expected_block = raw_latest_block - CONFIRMATION_LAG_BLOCKS
+    assert report.balance_checks[0].checked_at_block == expected_block
+    assert set(repository.checkpoints.values()) == {expected_block}

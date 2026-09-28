@@ -60,6 +60,28 @@ async def test_rate_limited_url_enters_cooldown_and_is_skipped_on_next_call() ->
 
 
 @respx.mock
+async def test_rate_limited_response_invokes_on_rate_limited_callback() -> None:
+    respx.post("https://a.example").mock(return_value=httpx.Response(429))
+    rate_limited_calls = 0
+
+    def record_rate_limit() -> None:
+        nonlocal rate_limited_calls
+        rate_limited_calls += 1
+
+    client = JsonRpcClient(
+        urls_by_kind={"call": ("https://a.example",)},
+        timeout_seconds=5,
+        keepalive_timeout_seconds=5,
+        rate_limit_cooldown_seconds=30.0,
+        on_rate_limited=record_rate_limit,
+    )
+    with pytest.raises(RpcAllEndpointsExhaustedError):
+        await client.call("call", "eth_blockNumber", [])
+    assert rate_limited_calls == 1
+    await client.aclose()
+
+
+@respx.mock
 async def test_batch_call_returns_results_in_request_order() -> None:
     respx.post("https://a.example").mock(
         return_value=httpx.Response(

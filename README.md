@@ -11,6 +11,15 @@ balance of every asset matches `balanceOf` on the latest block.
     make docker-up
     make migrate
 
+`make migrate` (`app/db/migrate.py`) just runs every `*.sql` file in
+`app/db/migrations` in sorted order with no tracking of what's already been
+applied, and `001_init.sql` uses `CREATE TABLE IF NOT EXISTS`. If you already have
+a `polymarket_wallet_history` database created before this project's schema was
+corrected, `make migrate` will silently no-op against the old schema instead of
+fixing it — drop and recreate the database instead:
+
+    docker compose down -v && make docker-up && make migrate
+
 ## Run
 
     make run                                                     # uses WALLET_ADDRESS from .env

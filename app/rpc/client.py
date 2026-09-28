@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import time
+from collections.abc import Callable
 from typing import Any, Literal
 
 import httpx
@@ -31,6 +32,7 @@ class JsonRpcClient:
         keepalive_timeout_seconds: float,
         rate_limit_cooldown_seconds: float,
         http_client: httpx.AsyncClient | None = None,
+        on_rate_limited: Callable[[], None] | None = None,
     ) -> None:
         self._urls_by_kind = urls_by_kind
         self._cooldown_seconds = rate_limit_cooldown_seconds
@@ -39,6 +41,11 @@ class JsonRpcClient:
             timeout=httpx.Timeout(timeout_seconds),
             limits=httpx.Limits(keepalive_expiry=keepalive_timeout_seconds),
         )
+        self.on_rate_limited = on_rate_limited
+
+    @property
+    def rate_limit_cooldown_seconds(self) -> float:
+        return self._cooldown_seconds
 
     def _available_urls(self, kind: RpcKind) -> list[str]:
         now = time.monotonic()
@@ -51,6 +58,8 @@ class JsonRpcClient:
         response = await self._http.post(url, json=payload)
         if response.status_code == 429:
             self._cooldown_until[url] = time.monotonic() + self._cooldown_seconds
+            if self.on_rate_limited is not None:
+                self.on_rate_limited()
             raise httpx.HTTPStatusError("rate limited", request=response.request, response=response)
         response.raise_for_status()
         return response.json()

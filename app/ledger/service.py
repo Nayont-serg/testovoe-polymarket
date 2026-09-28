@@ -15,6 +15,11 @@ from app.ledger.reconciliation import reconcile_asset
 from app.rpc import contracts
 from app.rpc.client import JsonRpcClient
 
+# Polygon's PoS validator set has occasionally produced short reorgs; scanning and
+# reconciling only up to latest_block - CONFIRMATION_LAG_BLOCKS keeps the checkpointed
+# range clear of blocks that could still be orphaned.
+CONFIRMATION_LAG_BLOCKS = 20
+
 
 @dataclass(frozen=True)
 class LedgerReport:
@@ -36,12 +41,16 @@ class LedgerService:
     async def run(self, wallet_address: str) -> LedgerReport:
         wallet_address = wallet_address.lower()
         await self._repository.ensure_wallet(wallet_address)
-        latest_block = int(await self._client.call("call", "eth_blockNumber", []), 16)
+        raw_latest_block = int(await self._client.call("call", "eth_blockNumber", []), 16)
+        latest_block = raw_latest_block - CONFIRMATION_LAG_BLOCKS
         limiter = AdaptiveConcurrencyLimiter(
             self._settings.goldsky_raw_log_rpc_concurrency_min,
             self._settings.goldsky_raw_log_rpc_concurrency_start,
             self._settings.goldsky_raw_log_rpc_concurrency_max,
             self._settings.goldsky_raw_log_rpc_concurrency_grow_interval_sec,
+        )
+        self._client.on_rate_limited = lambda: limiter.degrade(
+            self._client.rate_limit_cooldown_seconds
         )
 
         checks: list[BalanceCheckResult] = []
