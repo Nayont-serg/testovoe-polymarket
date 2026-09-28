@@ -80,6 +80,36 @@ async def test_checkpoint_roundtrip(pool: asyncpg.Pool) -> None:
     assert await repository.get_checkpoint(WALLET, asset_id) == 12345
 
 
+async def test_list_erc1155_assets_for_wallet_excludes_checkpoint_sentinel(
+    pool: asyncpg.Pool,
+) -> None:
+    repository = LedgerRepository(pool)
+    await repository.ensure_wallet(WALLET)
+    position_1 = Asset(
+        kind="erc1155", contract_address="0xctf", position_id=1, symbol=None, decimals=0
+    )
+    position_2 = Asset(
+        kind="erc1155", contract_address="0xctf", position_id=2, symbol=None, decimals=0
+    )
+    checkpoint_sentinel = Asset(
+        kind="erc1155", contract_address="0xctf", position_id=None, symbol=None, decimals=None
+    )
+    position_1_id = await repository.ensure_asset(position_1)
+    position_2_id = await repository.ensure_asset(position_2)
+    checkpoint_id = await repository.ensure_asset(checkpoint_sentinel)
+    await repository.upsert_events(position_1_id, [make_entry(position_1, "0xpos1", 0, 100)])
+    await repository.upsert_events(position_2_id, [make_entry(position_2, "0xpos2", 0, 200)])
+    await repository.upsert_events(
+        checkpoint_id, [make_entry(checkpoint_sentinel, "0xcheckpoint", 0, 0)]
+    )
+    await repository.set_checkpoint(WALLET, checkpoint_id, 12345)
+
+    assets = await repository.list_erc1155_assets_for_wallet(WALLET)
+
+    assert {asset.position_id for asset in assets} == {1, 2}
+    assert all(asset.position_id is not None for asset in assets)
+
+
 async def test_save_balance_check_persists_result(pool: asyncpg.Pool) -> None:
     repository = LedgerRepository(pool)
     await repository.ensure_wallet(WALLET)

@@ -274,7 +274,10 @@ async def discover_ctf_transfers(
             if not _is_new(seen, log):
                 continue
             _, from_address, to_address, pairs = decode_transfer_batch(log["topics"], log["data"])
+            coalesced: dict[int, int] = {}
             for position_id, amount in pairs:
+                coalesced[position_id] = coalesced.get(position_id, 0) + amount
+            for position_id, amount in coalesced.items():
                 fresh.append(
                     RawTransfer(
                         contract_address=ctf_address,

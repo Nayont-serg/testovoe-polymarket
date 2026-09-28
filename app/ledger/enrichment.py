@@ -60,7 +60,8 @@ def build_ledger_entry(
     block_timestamp: datetime,
 ) -> LedgerEntry:
     is_outgoing = transfer.from_address == wallet_address
-    delta = -transfer.amount if is_outgoing else transfer.amount
+    is_self_transfer = transfer.from_address == transfer.to_address
+    delta = 0 if is_self_transfer else (-transfer.amount if is_outgoing else transfer.amount)
     counterparty = transfer.to_address if is_outgoing else transfer.from_address
     receipt_topics = {log["topics"][0] for log in receipt["logs"] if log["topics"]}
     event_type = classify_event_type(counterparty, receipt_topics)

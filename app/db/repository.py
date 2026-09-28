@@ -60,6 +60,27 @@ class LedgerRepository:
             ],
         )
 
+    async def list_erc1155_assets_for_wallet(self, wallet_address: str) -> list[Asset]:
+        rows = await self._pool.fetch(
+            """
+            SELECT DISTINCT a.kind, a.contract_address, a.position_id, a.symbol, a.decimals
+            FROM assets a
+            JOIN balance_events be ON be.asset_id = a.id
+            WHERE be.wallet_address = $1 AND a.kind = 'erc1155' AND a.position_id IS NOT NULL
+            """,
+            wallet_address,
+        )
+        return [
+            Asset(
+                kind=row["kind"],
+                contract_address=row["contract_address"],
+                position_id=int(row["position_id"]),
+                symbol=row["symbol"],
+                decimals=row["decimals"],
+            )
+            for row in rows
+        ]
+
     async def get_checkpoint(self, wallet_address: str, asset_id: int) -> int | None:
         row = await self._pool.fetchrow(
             "SELECT last_scanned_block FROM index_checkpoints "

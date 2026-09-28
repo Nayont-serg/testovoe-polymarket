@@ -98,7 +98,7 @@ class FakeClient:
 
 class FakeRepository:
     def __init__(self) -> None:
-        self.events: list[LedgerEntry] = []
+        self.events: list[tuple[int, LedgerEntry]] = []
         self.checkpoints: dict[tuple[str, int], int] = {}
         self.checks: list[BalanceCheckResult] = []
         self._next_asset_id = 1
@@ -120,14 +120,30 @@ class FakeRepository:
     async def set_checkpoint(self, wallet_address: str, asset_id: int, block_number: int) -> None:
         self.checkpoints[(wallet_address, asset_id)] = block_number
 
-    async def upsert_events(self, _asset_id: int, entries: list[LedgerEntry]) -> None:
-        self.events.extend(entries)
+    async def upsert_events(self, asset_id: int, entries: list[LedgerEntry]) -> None:
+        self.events.extend((asset_id, entry) for entry in entries)
 
-    async def sum_balance(self, wallet_address: str, _asset_id: int) -> int:
-        return sum(e.delta for e in self.events if e.wallet_address == wallet_address)
+    async def sum_balance(self, wallet_address: str, asset_id: int) -> int:
+        return sum(
+            entry.delta
+            for stored_asset_id, entry in self.events
+            if entry.wallet_address == wallet_address and stored_asset_id == asset_id
+        )
 
     async def save_balance_check(self, result: BalanceCheckResult, _asset_id: int) -> None:
         self.checks.append(result)
+
+    async def list_erc1155_assets_for_wallet(self, wallet_address: str) -> list[Asset]:
+        seen: dict[int | None, Asset] = {}
+        for _asset_id, entry in self.events:
+            asset = entry.asset
+            if (
+                entry.wallet_address == wallet_address
+                and asset.kind == "erc1155"
+                and asset.position_id is not None
+            ):
+                seen[asset.position_id] = asset
+        return list(seen.values())
 
 
 async def test_ledger_service_run_produces_matched_report_for_single_asset(
@@ -234,3 +250,67 @@ async def test_ledger_service_process_ctf_batches_receipts_and_timestamps_across
     assert len(receipt_calls[0]) == 2
     assert len(timestamp_calls) == 1
     assert len(timestamp_calls[0]) == 2
+
+
+class FakeCtfResumeClient:
+    def __init__(self, single_incoming_log: dict[str, Any]) -> None:
+        self._single_incoming_log = single_incoming_log
+        self.latest_block = 10
+        self.discover_new_logs = True
+
+    async def call(self, _kind: str, method: str, params: list[Any]) -> Any:
+        if method == "eth_blockNumber":
+            return hex(self.latest_block)
+        if method == "eth_getLogs":
+            topics = params[0]["topics"]
+            if (
+                self.discover_new_logs
+                and topics[0] == TRANSFER_SINGLE_TOPIC
+                and topics[3] is not None
+            ):
+                return [self._single_incoming_log]
+            return []
+        if method == "eth_call":
+            return "0x" + format(0, "064x")
+        raise AssertionError(method)
+
+    async def batch_call(self, kind: str, requests: list[Any]) -> list[Any]:
+        if kind == "receipt":
+            return [{"logs": []} for _ in requests]
+        return [{"timestamp": hex(1_700_000_000)} for _ in requests]
+
+
+async def test_ledger_service_second_run_still_reconciles_ctf_positions_from_first_run(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app.rpc import contracts
+
+    wallet = "0x46b353667fd7d846af3bbeda6584b0e5b883d3de"
+    counterparty = "0x9999999999999999999999999999999999999999"
+    monkeypatch.setattr(contracts, "COLLATERAL_ASSETS", ())
+    monkeypatch.setattr(contracts, "CTF_DEPLOY_BLOCK", 0)
+
+    single_incoming_log = {
+        "topics": [
+            TRANSFER_SINGLE_TOPIC,
+            address_topic(counterparty),
+            address_topic(counterparty),
+            address_topic(wallet),
+        ],
+        "data": "0x" + format(7, "064x") + format(50, "064x"),
+        "blockNumber": hex(9),
+        "transactionHash": "0xctf-resume",
+        "logIndex": "0x0",
+    }
+    client = FakeCtfResumeClient(single_incoming_log)
+    repository = FakeRepository()
+    service = LedgerService(client, repository, FakeSettings())
+
+    first_report = await service.run(wallet)
+    assert len(first_report.balance_checks) == 1
+
+    client.latest_block = 20
+    client.discover_new_logs = False
+    second_report = await service.run(wallet)
+
+    assert len(second_report.balance_checks) == 1

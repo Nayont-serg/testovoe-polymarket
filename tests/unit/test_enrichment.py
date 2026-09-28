@@ -45,6 +45,26 @@ def test_build_ledger_entry_negates_delta_for_outgoing_transfer() -> None:
     assert entry.event_type == "WITHDRAWAL"
 
 
+def test_build_ledger_entry_zeroes_delta_for_self_transfer() -> None:
+    asset = Asset(
+        kind="erc20", contract_address="0xusdc", position_id=None, symbol="USDC", decimals=6
+    )
+    transfer = RawTransfer(
+        contract_address="0xusdc",
+        source_event="Transfer",
+        from_address=WALLET,
+        to_address=WALLET,
+        position_id=None,
+        amount=1_000,
+        block_number=10,
+        tx_hash="0xabc",
+        log_index=0,
+    )
+    receipt = {"logs": [{"topics": ["0xsomeothertopic"]}]}
+    entry = build_ledger_entry(transfer, asset, WALLET, receipt, datetime(2024, 1, 1, tzinfo=UTC))
+    assert entry.delta == 0
+
+
 def test_build_ledger_entry_keeps_positive_delta_for_incoming_transfer() -> None:
     asset = Asset(
         kind="erc20", contract_address="0xusdc", position_id=None, symbol="USDC", decimals=6

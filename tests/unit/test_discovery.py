@@ -389,6 +389,51 @@ async def test_discover_ctf_transfers_merges_out_and_in_and_explodes_pairs() -> 
         assert batch_out.log_index == 1
 
 
+async def test_discover_ctf_transfers_coalesces_duplicate_position_id_within_one_batch_log() -> (
+    None
+):
+    wallet = "0x46b353667fd7d846af3bbeda6584b0e5b883d3de"
+    counterparty = "0x9999999999999999999999999999999999999999"
+    operator = "0x8888888888888888888888888888888888888888"
+    batch_in_log = {
+        "topics": [
+            TRANSFER_BATCH_TOPIC,
+            address_topic(operator),
+            address_topic(counterparty),
+            address_topic(wallet),
+        ],
+        "data": _encode_transfer_batch_data([5, 5], [100, 200]),
+        "blockNumber": hex(33),
+        "transactionHash": "0xbatch-dup",
+        "logIndex": "0x2",
+    }
+
+    class DuplicatePairBatchClient:
+        async def call(
+            self, _kind: str, _method: str, params: list[dict[str, Any]]
+        ) -> list[dict[str, Any]]:
+            topics = params[0]["topics"]
+            if topics[0] == TRANSFER_BATCH_TOPIC and topics[3] is not None:
+                return [batch_in_log]
+            return []
+
+    client = DuplicatePairBatchClient()
+    limiter = AdaptiveConcurrencyLimiter(2, 60, 100, 180)
+    transfers: list[RawTransfer] = []
+
+    async def sink(batch: list[RawTransfer]) -> None:
+        transfers.extend(batch)
+
+    await discover_ctf_transfers(
+        client, limiter, "0xctf", wallet, start_block=0, end_block=100, window=1000, sink=sink
+    )
+
+    batch_transfers = [t for t in transfers if t.source_event == "TransferBatch"]
+    assert len(batch_transfers) == 1
+    assert batch_transfers[0].position_id == 5
+    assert batch_transfers[0].amount == 300
+
+
 class ManyChunksFakeClient:
     def __init__(self, logs_per_chunk: int, counterparty: str) -> None:
         self._logs_per_chunk = logs_per_chunk

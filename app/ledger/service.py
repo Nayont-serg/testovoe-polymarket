@@ -158,7 +158,7 @@ class LedgerService:
         )
 
         await self._repository.set_checkpoint(wallet_address, checkpoint_asset_id, latest_block)
-        return list(assets_by_position.values())
+        return await self._repository.list_erc1155_assets_for_wallet(wallet_address)
 
     async def _persist_transfers(
         self,
