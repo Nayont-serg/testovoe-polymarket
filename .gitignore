@@ -4,6 +4,4 @@ __pycache__/
 .pytest_cache/
 .ruff_cache/
 .env
-docs/superpowers/specs/
-docs/superpowers/plans/
 .idea
