@@ -17,7 +17,7 @@ def _settings() -> Settings:
     env = dict(os.environ)
     env.setdefault(
         "DATABASE_URL",
-        "postgresql://polymarket:polymarket@localhost:5433/polymarket_wallet_history",
+        "postgresql://polymarket:polymarket@localhost:5433/polymarket_wallet_history_test",
     )
     env.setdefault(
         "LOG_RPC_URLS",
