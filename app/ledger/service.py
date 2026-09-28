@@ -15,9 +15,7 @@ from app.ledger.reconciliation import reconcile_asset
 from app.rpc import contracts
 from app.rpc.client import JsonRpcClient
 
-# Polygon's PoS validator set has occasionally produced short reorgs; scanning and
-# reconciling only up to latest_block - CONFIRMATION_LAG_BLOCKS keeps the checkpointed
-# range clear of blocks that could still be orphaned.
+# Stays clear of blocks that could still be orphaned by a short Polygon reorg.
 CONFIRMATION_LAG_BLOCKS = 20
 
 
