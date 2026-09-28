@@ -12,7 +12,7 @@ from app.ledger.discovery import (
     discover_ctf_transfers,
     discover_erc20_transfers,
 )
-from app.ledger.models import Asset
+from app.ledger.models import Asset, RawTransfer
 from app.rpc.client import LogQueryTooLargeError, RpcAllEndpointsExhaustedError
 from app.rpc.codec import (
     TRANSFER_BATCH_TOPIC,
@@ -111,7 +111,12 @@ async def test_fetch_wallet_logs_bisects_wide_chunk_that_exceeds_provider_cap() 
     found_log = {"blockNumber": hex(750), "transactionHash": "0xfound", "logIndex": "0x0"}
     client = BisectingFakeClient(threshold=10, found_log=found_log, found_block=750)
     limiter = AdaptiveConcurrencyLimiter(2, 60, 100, 180)
-    logs = await _fetch_wallet_logs(
+    collected: list[dict[str, Any]] = []
+
+    async def sink(logs: list[dict[str, Any]]) -> None:
+        collected.extend(logs)
+
+    await _fetch_wallet_logs(
         client,
         limiter,
         "0xusdc",
@@ -119,8 +124,9 @@ async def test_fetch_wallet_logs_bisects_wide_chunk_that_exceeds_provider_cap() 
         start_block=0,
         end_block=999,
         window=1000,
+        sink=sink,
     )
-    assert logs == [found_log]
+    assert collected == [found_log]
 
 
 class TaskCountingFakeClient:
@@ -144,7 +150,12 @@ async def test_fetch_wallet_logs_bounds_live_task_count_during_deep_bisection() 
     client = TaskCountingFakeClient()
     worker_count = 4
     limiter = AdaptiveConcurrencyLimiter(worker_count, worker_count, worker_count, 180)
-    logs = await _fetch_wallet_logs(
+    collected: list[dict[str, Any]] = []
+
+    async def sink(logs: list[dict[str, Any]]) -> None:
+        collected.extend(logs)
+
+    await _fetch_wallet_logs(
         client,
         limiter,
         "0xusdc",
@@ -152,8 +163,9 @@ async def test_fetch_wallet_logs_bounds_live_task_count_during_deep_bisection() 
         start_block=0,
         end_block=999,
         window=1000,
+        sink=sink,
     )
-    assert logs == []
+    assert collected == []
     assert client.max_tasks_observed <= worker_count + 2
 
 
@@ -229,8 +241,13 @@ async def test_discover_erc20_transfers_merges_in_and_out_and_decodes() -> None:
     asset = Asset(
         kind="erc20", contract_address="0xusdc", position_id=None, symbol="USDC", decimals=6
     )
-    transfers = await discover_erc20_transfers(
-        client, limiter, asset, wallet, start_block=0, end_block=100, window=1000
+    transfers: list[RawTransfer] = []
+
+    async def sink(batch: list[RawTransfer]) -> None:
+        transfers.extend(batch)
+
+    await discover_erc20_transfers(
+        client, limiter, asset, wallet, start_block=0, end_block=100, window=1000, sink=sink
     )
     amounts = sorted(t.amount for t in transfers)
     assert amounts == [500, 700]
@@ -330,8 +347,13 @@ async def test_discover_ctf_transfers_merges_out_and_in_and_explodes_pairs() -> 
     }
     client = FakeCtfClient(single_out_log, single_in_log, batch_out_log, batch_in_log)
     limiter = AdaptiveConcurrencyLimiter(2, 60, 100, 180)
-    transfers = await discover_ctf_transfers(
-        client, limiter, "0xctf", wallet, start_block=0, end_block=100, window=1000
+    transfers: list[RawTransfer] = []
+
+    async def sink(batch: list[RawTransfer]) -> None:
+        transfers.extend(batch)
+
+    await discover_ctf_transfers(
+        client, limiter, "0xctf", wallet, start_block=0, end_block=100, window=1000, sink=sink
     )
 
     single_transfers = sorted(
@@ -365,3 +387,65 @@ async def test_discover_ctf_transfers_merges_out_and_in_and_explodes_pairs() -> 
         assert batch_out.to_address == counterparty.lower()
         assert batch_out.block_number == 22
         assert batch_out.log_index == 1
+
+
+class ManyChunksFakeClient:
+    def __init__(self, logs_per_chunk: int, counterparty: str) -> None:
+        self._logs_per_chunk = logs_per_chunk
+        self._counterparty_topic = address_topic(counterparty)
+
+    async def call(
+        self, _kind: str, _method: str, params: list[dict[str, Any]]
+    ) -> list[dict[str, Any]]:
+        topics = params[0]["topics"]
+        if topics[2] is None:
+            return []
+        from_block = int(params[0]["fromBlock"], 16)
+        return [
+            {
+                "topics": [TRANSFER_TOPIC, self._counterparty_topic, topics[2]],
+                "data": "0x" + format(1, "064x"),
+                "blockNumber": hex(from_block),
+                "transactionHash": f"0x{from_block}-{i}",
+                "logIndex": hex(i),
+            }
+            for i in range(self._logs_per_chunk)
+        ]
+
+
+async def test_discover_erc20_transfers_streams_batches_instead_of_accumulating_everything() -> (
+    None
+):
+    wallet = "0x46b353667fd7d846af3bbeda6584b0e5b883d3de"
+    counterparty = "0x9999999999999999999999999999999999999999"
+    logs_per_chunk = 10
+    chunk_count = 200
+    client = ManyChunksFakeClient(logs_per_chunk, counterparty)
+    limiter = AdaptiveConcurrencyLimiter(8, 8, 8, 180)
+    asset = Asset(
+        kind="erc20", contract_address="0xusdc", position_id=None, symbol="USDC", decimals=6
+    )
+    batch_sizes: list[int] = []
+    total_transfers = 0
+
+    async def sink(batch: list[RawTransfer]) -> None:
+        nonlocal total_transfers
+        batch_sizes.append(len(batch))
+        total_transfers += len(batch)
+
+    await discover_erc20_transfers(
+        client,
+        limiter,
+        asset,
+        wallet,
+        start_block=0,
+        end_block=chunk_count - 1,
+        window=1,
+        sink=sink,
+    )
+
+    expected_total = logs_per_chunk * chunk_count
+    assert total_transfers == expected_total
+    assert len(batch_sizes) > 1
+    assert max(batch_sizes) <= logs_per_chunk
+    assert max(batch_sizes) < expected_total

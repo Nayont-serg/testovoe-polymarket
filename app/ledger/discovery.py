@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import time
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from typing import Any
 
 from app.ledger.models import Asset, RawTransfer
@@ -80,15 +80,12 @@ def block_chunks(start_block: int, end_block: int, window: int) -> list[tuple[in
     return chunks
 
 
-def _dedupe_logs(logs: list[RpcLog]) -> list[RpcLog]:
-    seen: set[tuple[str, str]] = set()
-    unique: list[RpcLog] = []
-    for log in logs:
-        key = (log["transactionHash"], log["logIndex"])
-        if key not in seen:
-            seen.add(key)
-            unique.append(log)
-    return unique
+def _is_new(seen: set[tuple[str, str]], log: RpcLog) -> bool:
+    key = (log["transactionHash"], log["logIndex"])
+    if key in seen:
+        return False
+    seen.add(key)
+    return True
 
 
 async def _fetch_chunk(
@@ -129,7 +126,8 @@ async def _fetch_wallet_logs(
     start_block: int,
     end_block: int,
     window: int,
-) -> list[RpcLog]:
+    sink: Callable[[list[RpcLog]], Awaitable[None]],
+) -> None:
     # A bounded worker pool draining a queue of cheap (start, end) tuples, rather than
     # recursive fan-out: recursive asyncio.gather bisection creates a live Task per
     # bisection-tree node gated only by its parent's HTTP call completing, not by the
@@ -138,8 +136,6 @@ async def _fetch_wallet_logs(
     queue: asyncio.Queue[tuple[int, int]] = asyncio.Queue()
     for chunk_start, chunk_end in block_chunks(start_block, end_block, window):
         queue.put_nowait((chunk_start, chunk_end))
-
-    results: list[RpcLog] = []
 
     async def worker() -> None:
         while True:
@@ -150,7 +146,8 @@ async def _fetch_wallet_logs(
             await limiter.acquire()
             try:
                 logs = await _fetch_chunk(client, contract_address, topics, chunk_start, chunk_end)
-                results.extend(logs)
+                if logs:
+                    await sink(logs)
             except LogQueryTooLargeError:
                 if chunk_start == chunk_end:
                     raise
@@ -165,7 +162,6 @@ async def _fetch_wallet_logs(
     for error in errors:
         if isinstance(error, BaseException):
             raise error
-    return results
 
 
 async def discover_erc20_transfers(
@@ -176,9 +172,34 @@ async def discover_erc20_transfers(
     start_block: int,
     end_block: int,
     window: int,
-) -> list[RawTransfer]:
+    sink: Callable[[list[RawTransfer]], Awaitable[None]],
+) -> None:
     wallet_topic = address_topic(wallet_address)
-    outgoing, incoming = await asyncio.gather(
+    seen: set[tuple[str, str]] = set()
+
+    async def handle_logs(logs: list[RpcLog]) -> None:
+        fresh: list[RawTransfer] = []
+        for log in logs:
+            if not _is_new(seen, log):
+                continue
+            from_address, to_address, amount = decode_erc20_transfer(log["topics"], log["data"])
+            fresh.append(
+                RawTransfer(
+                    contract_address=asset.contract_address,
+                    source_event="Transfer",
+                    from_address=from_address,
+                    to_address=to_address,
+                    position_id=None,
+                    amount=amount,
+                    block_number=int(log["blockNumber"], 16),
+                    tx_hash=log["transactionHash"],
+                    log_index=int(log["logIndex"], 16),
+                )
+            )
+        if fresh:
+            await sink(fresh)
+
+    await asyncio.gather(
         _fetch_wallet_logs(
             client,
             limiter,
@@ -187,6 +208,7 @@ async def discover_erc20_transfers(
             start_block,
             end_block,
             window,
+            handle_logs,
         ),
         _fetch_wallet_logs(
             client,
@@ -196,25 +218,9 @@ async def discover_erc20_transfers(
             start_block,
             end_block,
             window,
+            handle_logs,
         ),
     )
-    transfers: list[RawTransfer] = []
-    for log in _dedupe_logs(outgoing + incoming):
-        from_address, to_address, amount = decode_erc20_transfer(log["topics"], log["data"])
-        transfers.append(
-            RawTransfer(
-                contract_address=asset.contract_address,
-                source_event="Transfer",
-                from_address=from_address,
-                to_address=to_address,
-                position_id=None,
-                amount=amount,
-                block_number=int(log["blockNumber"], 16),
-                tx_hash=log["transactionHash"],
-                log_index=int(log["logIndex"], 16),
-            )
-        )
-    return transfers
 
 
 async def discover_ctf_transfers(
@@ -225,71 +231,23 @@ async def discover_ctf_transfers(
     start_block: int,
     end_block: int,
     window: int,
-) -> list[RawTransfer]:
+    sink: Callable[[list[RawTransfer]], Awaitable[None]],
+) -> None:
     wallet_topic = address_topic(wallet_address)
-    single_out, single_in, batch_out, batch_in = await asyncio.gather(
-        _fetch_wallet_logs(
-            client,
-            limiter,
-            ctf_address,
-            [TRANSFER_SINGLE_TOPIC, None, wallet_topic, None],
-            start_block,
-            end_block,
-            window,
-        ),
-        _fetch_wallet_logs(
-            client,
-            limiter,
-            ctf_address,
-            [TRANSFER_SINGLE_TOPIC, None, None, wallet_topic],
-            start_block,
-            end_block,
-            window,
-        ),
-        _fetch_wallet_logs(
-            client,
-            limiter,
-            ctf_address,
-            [TRANSFER_BATCH_TOPIC, None, wallet_topic, None],
-            start_block,
-            end_block,
-            window,
-        ),
-        _fetch_wallet_logs(
-            client,
-            limiter,
-            ctf_address,
-            [TRANSFER_BATCH_TOPIC, None, None, wallet_topic],
-            start_block,
-            end_block,
-            window,
-        ),
-    )
-    transfers: list[RawTransfer] = []
-    for log in _dedupe_logs(single_out + single_in):
-        _, from_address, to_address, position_id, amount = decode_transfer_single(
-            log["topics"], log["data"]
-        )
-        transfers.append(
-            RawTransfer(
-                contract_address=ctf_address,
-                source_event="TransferSingle",
-                from_address=from_address,
-                to_address=to_address,
-                position_id=position_id,
-                amount=amount,
-                block_number=int(log["blockNumber"], 16),
-                tx_hash=log["transactionHash"],
-                log_index=int(log["logIndex"], 16),
+    seen: set[tuple[str, str]] = set()
+
+    async def handle_single(logs: list[RpcLog]) -> None:
+        fresh: list[RawTransfer] = []
+        for log in logs:
+            if not _is_new(seen, log):
+                continue
+            _, from_address, to_address, position_id, amount = decode_transfer_single(
+                log["topics"], log["data"]
             )
-        )
-    for log in _dedupe_logs(batch_out + batch_in):
-        _, from_address, to_address, pairs = decode_transfer_batch(log["topics"], log["data"])
-        for position_id, amount in pairs:
-            transfers.append(
+            fresh.append(
                 RawTransfer(
                     contract_address=ctf_address,
-                    source_event="TransferBatch",
+                    source_event="TransferSingle",
                     from_address=from_address,
                     to_address=to_address,
                     position_id=position_id,
@@ -299,4 +257,71 @@ async def discover_ctf_transfers(
                     log_index=int(log["logIndex"], 16),
                 )
             )
-    return transfers
+        if fresh:
+            await sink(fresh)
+
+    async def handle_batch(logs: list[RpcLog]) -> None:
+        fresh: list[RawTransfer] = []
+        for log in logs:
+            if not _is_new(seen, log):
+                continue
+            _, from_address, to_address, pairs = decode_transfer_batch(log["topics"], log["data"])
+            for position_id, amount in pairs:
+                fresh.append(
+                    RawTransfer(
+                        contract_address=ctf_address,
+                        source_event="TransferBatch",
+                        from_address=from_address,
+                        to_address=to_address,
+                        position_id=position_id,
+                        amount=amount,
+                        block_number=int(log["blockNumber"], 16),
+                        tx_hash=log["transactionHash"],
+                        log_index=int(log["logIndex"], 16),
+                    )
+                )
+        if fresh:
+            await sink(fresh)
+
+    await asyncio.gather(
+        _fetch_wallet_logs(
+            client,
+            limiter,
+            ctf_address,
+            [TRANSFER_SINGLE_TOPIC, None, wallet_topic, None],
+            start_block,
+            end_block,
+            window,
+            handle_single,
+        ),
+        _fetch_wallet_logs(
+            client,
+            limiter,
+            ctf_address,
+            [TRANSFER_SINGLE_TOPIC, None, None, wallet_topic],
+            start_block,
+            end_block,
+            window,
+            handle_single,
+        ),
+        _fetch_wallet_logs(
+            client,
+            limiter,
+            ctf_address,
+            [TRANSFER_BATCH_TOPIC, None, wallet_topic, None],
+            start_block,
+            end_block,
+            window,
+            handle_batch,
+        ),
+        _fetch_wallet_logs(
+            client,
+            limiter,
+            ctf_address,
+            [TRANSFER_BATCH_TOPIC, None, None, wallet_topic],
+            start_block,
+            end_block,
+            window,
+            handle_batch,
+        ),
+    )

@@ -74,7 +74,11 @@ class LedgerService:
         asset_id = await self._repository.ensure_asset(asset)
         checkpoint = await self._repository.get_checkpoint(wallet_address, asset_id)
         scan_start = checkpoint + 1 if checkpoint is not None else default_start_block
-        transfers = await discover_erc20_transfers(
+
+        async def persist_batch(batch: list[RawTransfer]) -> None:
+            await self._persist_transfers(asset, asset_id, wallet_address, batch)
+
+        await discover_erc20_transfers(
             self._client,
             limiter,
             asset,
@@ -82,8 +86,8 @@ class LedgerService:
             scan_start,
             latest_block,
             self._settings.free_log_rpc_window_blocks,
+            persist_batch,
         )
-        await self._persist_transfers(asset, asset_id, wallet_address, transfers)
         await self._repository.set_checkpoint(wallet_address, asset_id, latest_block)
         return await self._reconcile(asset, wallet_address, latest_block)
 
@@ -100,42 +104,35 @@ class LedgerService:
         checkpoint_asset_id = await self._repository.ensure_asset(checkpoint_asset)
         checkpoint = await self._repository.get_checkpoint(wallet_address, checkpoint_asset_id)
         scan_start = checkpoint + 1 if checkpoint is not None else contracts.CTF_DEPLOY_BLOCK
-        transfers = await discover_ctf_transfers(
-            self._client,
-            limiter,
-            contracts.CTF_ADDRESS,
-            wallet_address,
-            scan_start,
-            latest_block,
-            self._settings.free_log_rpc_window_blocks,
-        )
+
         assets_by_position: dict[int, Asset] = {}
         asset_ids_by_position: dict[int, int] = {}
-        for transfer in transfers:
-            if transfer.position_id not in assets_by_position:
-                asset = Asset(
-                    kind="erc1155",
-                    contract_address=contracts.CTF_ADDRESS,
-                    position_id=transfer.position_id,
-                    symbol=None,
-                    decimals=0,
-                )
-                assets_by_position[transfer.position_id] = asset
-                asset_ids_by_position[transfer.position_id] = await self._repository.ensure_asset(
-                    asset
-                )
 
-        if transfers:
-            tx_hashes = list({t.tx_hash for t in transfers})
+        async def persist_batch(batch: list[RawTransfer]) -> None:
+            for transfer in batch:
+                if transfer.position_id not in asset_ids_by_position:
+                    asset = Asset(
+                        kind="erc1155",
+                        contract_address=contracts.CTF_ADDRESS,
+                        position_id=transfer.position_id,
+                        symbol=None,
+                        decimals=0,
+                    )
+                    # Concurrent batches may race here; ensure_asset's ON CONFLICT makes it benign.
+                    asset_id = await self._repository.ensure_asset(asset)
+                    assets_by_position[transfer.position_id] = asset
+                    asset_ids_by_position[transfer.position_id] = asset_id
+
+            tx_hashes = list({t.tx_hash for t in batch})
             receipts = await fetch_receipts(
                 self._client, tx_hashes, self._settings.w3_free_receipt_rpc_batch_size
             )
-            block_numbers = list({t.block_number for t in transfers})
+            block_numbers = list({t.block_number for t in batch})
             timestamps = await fetch_block_timestamps(
                 self._client, block_numbers, self._settings.w3_block_timestamps_rpc_batch_size
             )
             entries_by_asset_id: dict[int, list[LedgerEntry]] = {}
-            for transfer in transfers:
+            for transfer in batch:
                 asset = assets_by_position[transfer.position_id]
                 asset_id = asset_ids_by_position[transfer.position_id]
                 entry = build_ledger_entry(
@@ -148,6 +145,17 @@ class LedgerService:
                 entries_by_asset_id.setdefault(asset_id, []).append(entry)
             for asset_id, entries in entries_by_asset_id.items():
                 await self._repository.upsert_events(asset_id, entries)
+
+        await discover_ctf_transfers(
+            self._client,
+            limiter,
+            contracts.CTF_ADDRESS,
+            wallet_address,
+            scan_start,
+            latest_block,
+            self._settings.free_log_rpc_window_blocks,
+            persist_batch,
+        )
 
         await self._repository.set_checkpoint(wallet_address, checkpoint_asset_id, latest_block)
         return list(assets_by_position.values())
